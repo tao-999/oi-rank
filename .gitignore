@@ -1,0 +1,74 @@
+# --- Node / Package managers ---
+node_modules/
+package-lock.json.*.bak
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.cache/
+.tmp/
+.tmp-*/
+
+# --- Build outputs / tooling ---
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+.eslintcache
+.stylelintcache
+.turbo/
+.vite/
+.svelte-kit/
+.next/
+.nuxt/
+
+# --- Project specific: local data snapshots (do NOT commit) ---
+data/
+public/data/
+*.ndjson
+*.sqlite
+*.db
+*.db-journal
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Logs / runtime files ---
+logs/
+*.log
+*.log.*
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# --- OS / Editor junk ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- IDEs ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+
+# --- Images / design caches (optional) ---
+*.psd
+*.sketch
+*.tmp.png
+
+# --- Misc ---
+*.swp
+*.swo
+*.orig
+*.bak

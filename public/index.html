@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>USDT 永续 · 名义持仓排行榜（趋势检测）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    /* 仅隐藏旧的状态条（原来会显示“完成”） */
+    #state{ display:none !important; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>USDT 永续 · 名义持仓（USD）排行榜（默认升序）</h1>
+  <div class="controls">
+    <div class="card">
+      <label>名义最小值（USD）
+        <input id="minUSD" type="number" step="100000" value="10000000">
+      </label>
+    </div>
+    <div class="card">
+      <label>名义最大值（USD）
+        <input id="maxUSD" type="number" step="100000" value="20000000">
+      </label>
+    </div>
+    <div class="card">
+      <label>趋势窗口（逗号分隔）<span class="muted">示例：30m,1h,4h,24h</span>
+        <input id="wins" value="1h,4h,24h">
+      </label>
+    </div>
+    <!-- ✅ 新增：只看关注 -->
+    <div class="card">
+      <label style="flex-direction:row;align-items:center;gap:8px">
+        <input id="onlyFav" type="checkbox" style="min-width:auto">
+        <span>只看关注 ⭐</span>
+      </label>
+    </div>
+    <div class="card">
+      <label>过滤合约（包含匹配，逗号/空格分隔）
+        <input id="symFilter" placeholder="如：BTC, DOGE, AI">
+      </label>
+    </div>
+
+  </div>
+</header>
+
+<!-- 进度蒙层 -->
+<div id="overlay">
+  <div class="ov-card">
+    <h2 class="ov-title">初始化数据中…</h2>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="ov-meta"><div id="ovText">准备请求…</div><div id="ovPct">0%</div></div>
+  </div>
+</div>
+
+<!-- 右侧抽屉：名义USD历史图 -->
+<aside id="drawer">
+  <div class="head">
+    <h3 id="drawerTitle">—</h3>
+    <button id="btnClose">关闭</button>
+  </div>
+  <div class="body">
+    <div class="row">
+      <select id="aggSel" class="sel">
+        <option value="5m" selected>5 分钟</option>
+        <option value="15m">15 分钟</option>
+        <option value="30m">30 分钟</option>
+        <option value="1h">1 小时</option>
+        <option value="2h">2 小时</option>
+        <option value="4h">4 小时</option>
+        <option value="8h">8 小时</option>
+        <option value="12h">12 小时</option>
+        <option value="1d">1 日</option>
+        <option value="3d">3 日</option>
+        <option value="1w">1 周</option>
+      </select>
+      <span class="small" id="chartMeta">—</span>
+    </div>
+    <canvas id="chart" width="540" height="340"></canvas>
+    <div class="small">图表：名义持仓（USD，M）；每个时间桶取最后一笔（close）。支持拖拽/缩放。</div>
+  </div>
+</aside>
+
+<main>
+  <!-- 这行已隐藏；保留节点避免旧代码报错 -->
+  <div id="state" class="muted">WS 实时价/资费；快照每 1000s 自动刷新一次；趋势列从本地历史推算</div>
+  <div style="overflow:auto;margin-top:10px">
+    <table id="tbl">
+      <thead id="thead"></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+  <div id="meta" class="muted" style="margin-top:10px"></div>
+</main>
+
+<!-- 模块入口 -->
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

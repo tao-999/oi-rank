@@ -1,0 +1,53 @@
+:root{--bg:#0b0f15;--card:#121826;--fg:#e6edf3;--muted:#9aa4b2;--accent:#4da3ff}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,PingFang SC}
+header{padding:18px 16px;border-bottom:1px solid #1b2433;background:linear-gradient(180deg,#0d121a,#0b0f15)}
+h1{margin:0;font-size:18px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+.controls .card{background:var(--card);padding:10px 12px;border-radius:10px;border:1px solid #1b2433}
+label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)}
+input,select{background:#0e1420;color:#e6edf3;border:1px solid #1f2840;border-radius:8px;padding:8px 10px;min-width:160px;outline:none}
+main{padding:16px}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid #1b2433;table-layout:fixed}
+th,td{padding:10px 12px;border-bottom:1px solid #1b2433;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+th:first-child,td:first-child{text-align:left}
+th{position:sticky;top:0;background:#111827;color:#cbd5e1;z-index:1;user-select:none}
+tbody tr:hover{background:#0e1522;cursor:pointer}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #2b3958;background:#111a2b;color:#cfe1ff}
+.badge.copy{cursor:pointer;user-select:none}
+.muted{color:#9aa4b2}
+.num{font-variant-numeric:tabular-nums}
+.sortable{cursor:pointer}.sortable .arrow{opacity:.6;margin-left:6px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid #89b9ff;border-top-color:transparent;border-radius:50%;vertical-align:-2px;animation:spin .9s linear infinite}
+#state{margin-top:8px}
+tr.row-active{background:#162035 !important; outline:1px solid #2a87ff;}
+.copy-tip{position:fixed;padding:6px 10px;background:#0b1220;color:#cfe1ff;border:1px solid #26406a;border-radius:8px;font-size:12px;pointer-events:none;opacity:0;transform:translate(-50%,-140%);transition:opacity .15s ease}
+.copy-tip.show{opacity:1}
+#overlay{position:fixed;inset:0;background:rgba(9,12,18,.85);display:flex;align-items:center;justify-content:center;z-index:9999}
+.ov-card{width:min(520px,92vw);background:#0f1624;border:1px solid #1b2433;border-radius:14px;padding:24px;color:#cfe1ff;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+.ov-title{margin:0 0 8px;font-size:18px}
+.bar{height:10px;background:#0b1220;border:1px solid #203050;border-radius:999px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0%;background:linear-gradient(90deg,#2a87ff,#66c4ff)}
+.ov-meta{display:flex;justify-content:space-between;margin-top:8px;color:#9bb0cc;font-size:12px}
+#drawer{position:fixed;top:0;right:0;height:100%;width:min(560px,96vw);transform:translateX(100%);transition:transform .25s ease;z-index:9998;background:#0f1624;border-left:1px solid #1b2433;display:flex;flex-direction:column}
+#drawer.open{transform:translateX(0)}
+#drawer .head{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1b2433}
+#drawer .head h3{margin:0;font-size:16px}
+#drawer .body{padding:12px;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.sel{background:#0e1420;color:#e6edf3;border:1px solid #1f2840;border-radius:8px;padding:6px 10px}
+canvas{width:100%;height:340px;background:#0b121f;border:1px solid #1f2740;border-radius:10px;touch-action:none}
+.small{font-size:12px;color:#9aa4b2}
+.delta-pos{color:#31d0aa} .delta-neg{color:#ff6b6b}
+/* 合约单元格：星标 + 文本并排 */
+.sym-cell{ display:inline-flex; align-items:center; gap:8px; }
+
+/* 五角星按钮（默认灰，激活金色） */
+.fav-btn{
+  display:inline-flex; align-items:center; justify-content:center;
+  width:20px; height:20px; padding:0; margin:0;
+  border:1px solid transparent; border-radius:6px;
+  background:transparent; color:#7b8794; cursor:pointer;
+}
+.fav-btn:hover{ background:#0f1729; color:#a8b3c7; }
+.fav-btn.active{ color:#ffd166; }
+.fav-btn .star{ display:block; fill:currentColor; pointer-events:none; }
