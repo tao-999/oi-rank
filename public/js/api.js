@@ -15,3 +15,12 @@ export async function getTrends(winLabelsCsv){
   u.searchParams.set('wins', winLabelsCsv);
   const r = await fetch(u, {cache:'no-store'}); return r.json();
 }
+// 最新成交单
+export async function getTrades(symbol, limit = 200) {
+  const u = new URL('/api/trades', location.origin);
+  u.searchParams.set('symbol', symbol);
+  u.searchParams.set('limit', String(limit));
+  const r = await fetch(u, { cache: 'no-store' });
+  return r.json();
+}
+

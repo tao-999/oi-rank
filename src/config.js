@@ -8,6 +8,8 @@ module.exports = {
     exchangeInfo: '/fapi/v1/exchangeInfo',
     tickers: '/fapi/v1/ticker/price',
     premiumAll: '/fapi/v1/premiumIndex',
-    openInterest: '/fapi/v1/openInterest?symbol='
+    openInterest: '/fapi/v1/openInterest?symbol=',
+    aggTrades: '/fapi/v1/aggTrades?symbol='   // 可选
   }
+
 };

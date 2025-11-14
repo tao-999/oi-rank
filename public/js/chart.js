@@ -59,74 +59,40 @@ function computeHTFBias(allRaw, mode){
   return { mode, dir, dP, from: keys[0], to: keys[keys.length-1] };
 }
 
-/* ========= 注入图表下方的工具区（HTF 下拉 + 信号容器 + 样式） ========= */
-function ensureSignalUI(){
-  // 样式（只注入一次）
-  if(!document.getElementById('signalStyle')){
-    const css = document.createElement('style');
-    css.id = 'signalStyle';
-    css.textContent = `
-      .sig-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
-      .sig-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #2b3958;background:#111a2b;color:#cfe1ff;font-size:12px}
-      .sig-badge.sig-up{border-color:#2a7f4a;background:#0e1a14;color:#9be37d}
-      .sig-badge.sig-down{border-color:#7f2a2a;background:#1a0e10;color:#ff8a8a}
-      .sig-badge.sig-weak{opacity:.8}
-      #signalTools{margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-      #signalTools label{font-size:12px;color:#9aa4b2;display:flex;align-items:center;gap:6px}
-    `;
-    document.head.appendChild(css);
-  }
-
-  const body = document.getElementById('drawer')?.querySelector('.body') || document.body;
-
-  if(!document.getElementById('signalTools')){
-    const tools = document.createElement('div');
-    tools.id = 'signalTools';
-    tools.innerHTML = `
-      <label>大方向偏置
-        <select id="biasSel" class="sel">
-          <option value="off">关闭</option>
-          <option value="7d">最近 7 天</option>
-          <option value="30d">最近 30 天</option>
-        </select>
-      </label>
-    `;
-    body.appendChild(tools);
-  }
-  if(!document.getElementById('signalBox')){
-    const row = document.createElement('div');
-    row.id = 'signalBox';
-    row.className = 'sig-row';
-    row.innerHTML = `<span class="sig-badge sig-weak">加载中…</span>`;
-    body.appendChild(row);
-  }
-}
-
 /* ========= 主图组件 ========= */
 export function createChart(){
-  const drawer = el('drawer');
-  const drawerTitle=el('drawerTitle');
-  const btnClose=el('btnClose');
-  const aggSel=el('aggSel');
-  const canvas=el('chart');
-  const ctx2=canvas.getContext('2d');
-  const chartMeta=el('chartMeta');
+  const drawer      = el('drawer');
+  const drawerTitle = el('drawerTitle');
+  const btnClose    = el('btnClose');
+  const aggSel      = el('aggSel');
+  const canvas      = el('chart');
+  const ctx2        = canvas.getContext('2d');
+  const chartMeta   = el('chartMeta');
+  const signalBox   = el('signalBox');
+  const biasSel     = el('biasSel'); // 来自 HTML / 或你之前注入的选择器
 
-  let curSymbol=null, curSamples=[], liveTail=[], autoHistTimer=null;
-  let dragging=false,lastX=0, viewMin=0, viewMax=0, followTail=true;
+  let curSymbol   = null;
+  let curSamples  = [];
+  let liveTail    = [];
+  let autoHistTimer = null;
+  let dragging    = false;
+  let lastX       = 0;
+  let viewMin     = 0;
+  let viewMax     = 0;
+  let followTail  = true;
   let lastSignalHTML = '';
 
   // 左轴（价格）要多留点空间
   const PADL=54,PADR=64,PADT=18,PADB=30;
 
-  btnClose.addEventListener('click', ()=>{
-    drawer.classList.remove('open'); curSymbol=null;
-    if(autoHistTimer){clearInterval(autoHistTimer); autoHistTimer=null;}
-  });
-  aggSel.addEventListener('change', ()=> drawChart());
-
-  function getDataMinTime(){ const arr=curSamples.concat(liveTail); return arr.length?Math.min(...arr.map(s=>s.t)):Date.now()-3600e3; }
-  function getDataMaxTime(){ const arr=curSamples.concat(liveTail); return arr.length?Math.max(...arr.map(s=>s.t)):Date.now(); }
+  function getDataMinTime(){
+    const arr = curSamples.concat(liveTail);
+    return arr.length ? Math.min(...arr.map(s=>s.t)) : Date.now()-3600e3;
+  }
+  function getDataMaxTime(){
+    const arr = curSamples.concat(liveTail);
+    return arr.length ? Math.max(...arr.map(s=>s.t)) : Date.now();
+  }
   function getSpan(){ return Math.max(1000, viewMax-viewMin); }
   function clampView(){
     const dmin=getDataMinTime(), dmax=getDataMaxTime();
@@ -136,7 +102,9 @@ export function createChart(){
     if(viewMax>dmax){ viewMax=dmax; viewMin=dmax-span; }
   }
 
-  canvas.addEventListener('mousedown',e=>{dragging=true; lastX=e.clientX; followTail=false;});
+  canvas.addEventListener('mousedown',e=>{
+    dragging=true; lastX=e.clientX; followTail=false;
+  });
   canvas.addEventListener('mousemove',e=>{
     if(!dragging) return;
     const dx=e.clientX-lastX; lastX=e.clientX;
@@ -163,26 +131,40 @@ export function createChart(){
     drawChart();
   });
 
-  function drawChart(){
-    ensureSignalUI(); // 确保 UI 存在
-    const signalBox = el('signalBox');
-    const biasSel = el('biasSel');
+  btnClose.addEventListener('click', ()=>{
+    drawer.classList.remove('open');
+    curSymbol=null;
+    if(autoHistTimer){clearInterval(autoHistTimer); autoHistTimer=null;}
+    liveTail = [];
+  });
 
+  aggSel.addEventListener('change', ()=> drawChart());
+  if (biasSel) {
+    biasSel.addEventListener('change', ()=> drawChart());
+  }
+
+  function drawChart(){
     const ctx=ctx2, W=canvas.width,H=canvas.height;
     ctx.clearRect(0,0,W,H);
 
     const allRaw = curSamples.concat(liveTail).filter(s=>Number.isFinite(s.t));
-    if(!allRaw.length){ chartMeta.textContent='暂无历史样本'; if(signalBox) signalBox.innerHTML=''; return; }
+    if(!allRaw.length){
+      chartMeta.textContent='暂无历史样本';
+      if(signalBox) signalBox.innerHTML='';
+      return;
+    }
 
     const margin=getSpan()*0.2;
     const windowRaw = allRaw.filter(s=>s.t>=(viewMin-margin)&&s.t<=(viewMax+margin));
     const preset=aggSel.value;
 
-    // 桶后数据
     const data = resampleBuckets(windowRaw, preset).filter(d=>d.t>=viewMin&&d.t<=viewMax);
-    if(data.length<2){ chartMeta.textContent='数据点不足'; if(signalBox) signalBox.innerHTML=''; return; }
+    if(data.length<2){
+      chartMeta.textContent='数据点不足';
+      if(signalBox) signalBox.innerHTML='';
+      return;
+    }
 
-    // 取值范围
     const xs=data.map(d=>d.t);
     const nuVals=data.map(d=>d.nu).filter(Number.isFinite);
     const mpVals=data.map(d=>d.mp).filter(Number.isFinite);
@@ -277,13 +259,12 @@ export function createChart(){
       Number.isFinite(lastMp) ? `价格：${fmtPrice(lastMp)}` : ''
     ].filter(Boolean).join(' · ');
 
-    // —— 计算 HTF 偏置并渲染信号 —— //
-    const bias = computeHTFBias(curSamples.concat(liveTail), (biasSel?.value)||'off');
-    renderSignal(windowRaw, preset, bias, signalBox);
-    // 下拉切换后重画（只绑定一次，下一轮 draw 再续一次）
-    biasSel?.addEventListener('change', ()=> drawChart(), { once:true });
+    // —— HTF 偏置 & 信号 —— //
+    const biasMode = biasSel ? (biasSel.value || 'off') : 'off';
+    const bias = computeHTFBias(curSamples.concat(liveTail), biasMode);
+    renderSignal(windowRaw, preset, bias);
 
-    /* ———— 映射工具 ———— */
+    /* ———— 内部工具函数 ———— */
     function mapX(t){ return PADL + (W-PADL-PADR) * (t - viewMin) / (viewMax - viewMin || 1); }
     function mapYNu(v){ return H-PADB - (H-PADT-PADB) * (v - nuMin) / ((nuMax - nuMin) || 1); }
     function mapYPrice(v){ return H-PADB - (H-PADT-PADB) * (v - mpMin) / ((mpMax - mpMin) || 1); }
@@ -306,8 +287,7 @@ export function createChart(){
     }
   }
 
-  // —— 渲染方向信号（带 HTF 偏置） —— //
-  function renderSignal(windowRaw, preset, bias, signalBox){
+  function renderSignal(windowRaw, preset, bias){
     if (!signalBox) return;
 
     const edge = (key)=>{
@@ -335,7 +315,7 @@ export function createChart(){
     const TH_O = 0.005; // 0.5%
 
     if (!Number.isFinite(dP) || !Number.isFinite(dO)){
-      if (lastSignalHTML){ signalBox.innerHTML = lastSignalHTML; }
+      if (lastSignalHTML) signalBox.innerHTML = lastSignalHTML;
       return;
     }
 
@@ -399,7 +379,6 @@ export function createChart(){
       curSymbol=symbol;
       drawerTitle.textContent = symbol+' · 名义持仓（USD）历史';
       drawer.classList.add('open');
-      ensureSignalUI(); // 首次打开也保证 UI 存在
 
       const j = await loader(symbol);
       curSamples = (j.samples||[]).filter(s=>Number.isFinite(s.nu) || Number.isFinite(s.mp) || Number.isFinite(s.oi));
@@ -408,17 +387,18 @@ export function createChart(){
       viewMax = xs.length?Math.max(...xs):Date.now();
       followTail = true;
       liveTail=[]; 
-      lastSignalHTML = ''; // 清空旧合约信号
+      lastSignalHTML = '';
       drawChart();
 
       if (autoHistTimer) clearInterval(autoHistTimer);
       autoHistTimer=setInterval(async ()=>{
-        const j2=await loader(symbol);
+        if (!curSymbol) return;
+        const j2=await loader(curSymbol);
         curSamples=(j2.samples||[]).filter(s=>Number.isFinite(s.nu) || Number.isFinite(s.mp) || Number.isFinite(s.oi));
         drawChart();
       }, 180000);
     },
-    // 实时只推名义；窗口信号会用“最近一次有 mp/oi 的点”计算，不会每秒掉成观望
+    // 实时只推名义；窗口信号会用“最近一次有 mp/oi 的点”计算
     pushLive(nu,t){
       if(!curSymbol || !Number.isFinite(nu)) return;
       const tt=t||Date.now();

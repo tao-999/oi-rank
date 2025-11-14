@@ -80,6 +80,42 @@
     <canvas id="chart" width="540" height="340"></canvas>
     <div id="signalBox" class="signal"></div>
     <div class="small">图表：名义持仓（USD，M）；每个时间桶取最后一笔（close）。支持拖拽/缩放。</div>
+        <!-- ✅ 最新成交单面板（带区间过滤） -->
+    <div id="tradesPanel">
+      <div class="trades-header">
+        <span class="small trades-title">最新成交</span>
+        <button id="tradesRefresh" class="btn small">刷新</button>
+      </div>
+
+      <div class="row trades-filter">
+        <span class="small muted">成交量过滤（可选）：</span>
+        <label class="small trades-filter-item">
+          最小
+          <input id="tradesQtyMin" type="number" step="0.001" placeholder="不限">
+        </label>
+        <label class="small trades-filter-item">
+          最大
+          <input id="tradesQtyMax" type="number" step="0.001" placeholder="不限">
+        </label>
+      </div>
+
+      <div class="trades-table-wrap">
+        <table id="tradesTable" class="small">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>价格</th>
+              <th>成交额(USDT)</th>
+              <th>方向</th>
+            </tr>
+          </thead>
+          <tbody id="tradesTbody">
+            <tr><td colspan="4">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
   </div>
 </aside>
 
