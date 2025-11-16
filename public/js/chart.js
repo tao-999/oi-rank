@@ -1,63 +1,7 @@
 // public/js/chart.js
 import { el } from './utils.js';
-
-/* ========= 统一按时间桶聚合：取每桶“最后一笔”作为 close ========= */
-export function resampleBuckets(samples, presetKey){
-  const PRESET_MS = {
-    '5m':300000,'15m':900000,'30m':1800000,'1h':3600000,'2h':7200000,
-    '4h':14400000,'8h':28800000,'12h':43200000,'1d':86400000,'3d':259200000,'1w':604800000
-  };
-  const step = PRESET_MS[presetKey] || PRESET_MS['1h'];
-  const map = new Map(); // bucket -> last sample
-  for(const s of samples){
-    if (!s || (!Number.isFinite(s.nu) && !Number.isFinite(s.mp) && !Number.isFinite(s.oi))) continue;
-    const bucket = Math.floor(s.t/step)*step;
-    map.set(bucket, s); // 覆盖即取“最后一笔”
-  }
-  const keys = Array.from(map.keys()).sort((a,b)=>a-b);
-  return keys.map(k=>{
-    const s = map.get(k);
-    const nu = Number.isFinite(s.nu)? s.nu : undefined;
-    const mp = Number.isFinite(s.mp)? s.mp : undefined;
-    let oi = Number.isFinite(s.oi)? s.oi : (Number.isFinite(nu)&&Number.isFinite(mp)&&mp!==0 ? (nu/mp) : undefined);
-    return { t:k, nu, mp, oi };
-  });
-}
-
-/* ========= 计算高周期偏置（7d / 30d），仅用价格（mp） ========= */
-function computeHTFBias(allRaw, mode){
-  if(mode === 'off') return { mode, dir: 'flat', dP: 0, from:null, to:null };
-
-  const nowTs = Date.now();
-  const lookMs = mode === '30d' ? 30*86400000 : 7*86400000;
-  const fromTs = nowTs - lookMs;
-
-  const win = allRaw.filter(s => Number.isFinite(s.t) && s.t >= fromTs);
-  if(!win.length) return { mode, dir:'flat', dP:0, from:null, to:null };
-
-  const dayStep = 86400000;
-  const map = new Map(); // 日桶 -> 最后一笔
-  for(const s of win){
-    if(!Number.isFinite(s.mp)) continue;
-    const bucket = Math.floor(s.t/dayStep)*dayStep;
-    map.set(bucket, s);
-  }
-  const keys = Array.from(map.keys()).sort((a,b)=>a-b);
-  if(keys.length < 2) return { mode, dir:'flat', dP:0, from:null, to:null };
-
-  const first = map.get(keys[0]);
-  const last  = map.get(keys[keys.length-1]);
-  if(!Number.isFinite(first?.mp) || !Number.isFinite(last?.mp)) return { mode, dir:'flat', dP:0, from:null, to:null };
-
-  const dP = first.mp !== 0 ? (last.mp/first.mp - 1) : 0;
-  const TH = 0.01; // 1% 作为显著阈值
-
-  let dir = 'flat';
-  if (dP >  TH) dir = 'up';
-  else if (dP < -TH) dir = 'down';
-
-  return { mode, dir, dP, from: keys[0], to: keys[keys.length-1] };
-}
+import { getHistory } from './api.js';
+import { createPredictor } from './predictor.js';
 
 /* ========= 主图组件 ========= */
 export function createChart(){
@@ -66,350 +10,608 @@ export function createChart(){
   const btnClose    = el('btnClose');
   const aggSel      = el('aggSel');
   const canvas      = el('chart');
-  const ctx2        = canvas.getContext('2d');
+  const ctx         = canvas.getContext('2d');
   const chartMeta   = el('chartMeta');
   const signalBox   = el('signalBox');
-  const biasSel     = el('biasSel'); // 来自 HTML / 或你之前注入的选择器
 
-  let curSymbol   = null;
-  let curSamples  = [];
-  let liveTail    = [];
-  let autoHistTimer = null;
-  let dragging    = false;
-  let lastX       = 0;
-  let viewMin     = 0;
-  let viewMax     = 0;
-  let followTail  = true;
-  let lastSignalHTML = '';
+  let curSymbol = null;
+  let samples   = [];     // { t, nu, mp }
+  let liveTail  = [];
+  let autoTimer = null;
 
-  // 左轴（价格）要多留点空间
-  const PADL=54,PADR=64,PADT=18,PADB=30;
+  // 画布内边距（底部加大，给 X 轴文字和 tooltip）
+  const PADL=60, PADR=60, PADT=20, PADB=50;
 
-  function getDataMinTime(){
-    const arr = curSamples.concat(liveTail);
-    return arr.length ? Math.min(...arr.map(s=>s.t)) : Date.now()-3600e3;
-  }
-  function getDataMaxTime(){
-    const arr = curSamples.concat(liveTail);
-    return arr.length ? Math.max(...arr.map(s=>s.t)) : Date.now();
-  }
-  function getSpan(){ return Math.max(1000, viewMax-viewMin); }
-  function clampView(){
-    const dmin=getDataMinTime(), dmax=getDataMaxTime();
-    const span=getSpan(), total=Math.max(1000,dmax-dmin);
-    if(span>total){ viewMin=dmin; viewMax=dmax; return; }
-    if(viewMin<dmin){ viewMin=dmin; viewMax=dmin+span; }
-    if(viewMax>dmax){ viewMax=dmax; viewMin=dmax-span; }
-  }
+  // 交互状态
+  let lastBuckets = [];   // 最近一次聚合后的数据
+  let hoverIndex  = null; // 当前选中的时间桶 index
 
-  canvas.addEventListener('mousedown',e=>{
-    dragging=true; lastX=e.clientX; followTail=false;
+  // 预测器：内部自己用 OI 的 0.1% 来判定大单
+  const predictor = createPredictor({
+    windowMs: 30_000
   });
-  canvas.addEventListener('mousemove',e=>{
-    if(!dragging) return;
-    const dx=e.clientX-lastX; lastX=e.clientX;
-    const pxSpan=canvas.width-PADL-PADR; const tSpan=getSpan(); const dt=-dx*tSpan/pxSpan;
-    viewMin+=dt; viewMax+=dt; clampView(); drawChart();
-  });
-  canvas.addEventListener('mouseup',()=>dragging=false);
-  canvas.addEventListener('mouseleave',()=>dragging=false);
-  canvas.addEventListener('wheel',e=>{
-    e.preventDefault(); followTail=false;
-    const factor=e.deltaY<0?0.9:1.1;
-    const rect=canvas.getBoundingClientRect(); const x=e.clientX-rect.left; const pxSpan=canvas.width-PADL-PADR;
-    const ratio=Math.max(0,Math.min(1,(x-PADL)/pxSpan)); const center=viewMin+getSpan()*ratio;
-    let newSpan=getSpan()*factor;
-    newSpan=Math.max(60000,Math.min(newSpan,getDataMaxTime()-getDataMinTime()+60000));
-    viewMin=center-newSpan*ratio; viewMax=center+newSpan*(1-ratio);
-    clampView(); drawChart();
-  }, {passive:false});
-  canvas.addEventListener('dblclick', ()=>{
-    viewMax = getDataMaxTime();
-    const span = getSpan();
-    viewMin = viewMax - span;
-    followTail = true;
+
+  /* ============ 粒度 ============ */
+  const PRESET_MS = {
+    '5m' : 5 * 60 * 1000,
+    '15m': 15 * 60 * 1000,
+    '30m': 30 * 60 * 1000,
+    '1h' : 60 * 60 * 1000,
+    '2h' : 2  * 60 * 60 * 1000,
+    '4h' : 4  * 60 * 60 * 1000,
+    '6h' : 6  * 60 * 60 * 1000,
+    '12h': 12 * 60 * 60 * 1000,
+    '1d' : 24 * 60 * 60 * 1000
+  };
+
+  const PERIOD_FOR_API = {
+    '5m' : '5m',
+    '15m': '15m',
+    '30m': '30m',
+    '1h' : '1h',
+    '2h' : '2h',
+    '4h' : '4h',
+    '6h' : '6h',
+    '12h': '12h',
+    '1d' : '1d'
+  };
+
+  /* ============ 时间聚合 ============ */
+  function bucketize(arr, preset){
+    const step = PRESET_MS[preset];
+    const map  = new Map();
+
+    for (const s of arr){
+      if (!s) continue;
+      const t = Number(s.t);
+      if (!Number.isFinite(t)) continue;
+
+      const b = Math.floor(t / step) * step;
+      map.set(b, s);
+    }
+
+    return [...map.keys()].sort((a,b)=>a-b).map(k=>{
+      const s = map.get(k);
+      return {
+        t  : k,
+        nu : Number(s.nu)||0,
+        mp : Number(s.mp) || null
+      };
+    });
+  }
+
+  /* ============ 格式化 ============ */
+  function formatTimeLabel(ms, span){
+    const d = new Date(ms);
+    const h = String(d.getHours()).padStart(2,'0');
+    const m = String(d.getMinutes()).padStart(2,'0');
+
+    if (span > 2*86400000){
+      const mon = String(d.getMonth()+1).padStart(2,'0');
+      const day = String(d.getDate()).padStart(2,'0');
+      return `${mon}-${day}\n${h}:${m}`;
+    }
+    return `${h}:${m}`;
+  }
+
+  // tooltip 用：YYYY-MM-DD HH:mm
+  function formatTooltipTime(ms){
+    const d = new Date(ms);
+    const Y = d.getFullYear();
+    const M = String(d.getMonth()+1).padStart(2,'0');
+    const D = String(d.getDate()).padStart(2,'0');
+    const h = String(d.getHours()).padStart(2,'0');
+    const m = String(d.getMinutes()).padStart(2,'0');
+    return `${Y}-${M}-${D} ${h}:${m}`;
+  }
+
+  function formatUSD(v){
+    const abs = Math.abs(v);
+    if (abs >= 1e9) return (v/1e9).toFixed(2)+'B';
+    if (abs >= 1e6) return (v/1e6).toFixed(2)+'M';
+    if (abs >= 1e3) return (v/1e3).toFixed(1)+'K';
+    return v.toFixed(2);
+  }
+
+  /* ============ 预测 UI ============ */
+  function renderSignal(){
+    if (!signalBox) return;
+
+    const sig = predictor.getSignal();
+    const pc  = (sig.priceChangePct*100).toFixed(2);
+    const oc  = (sig.oiChangePct*100).toFixed(2);
+
+    let badgeCls = 'sig-weak';
+    if (sig.type === 'strong_long' || sig.type === 'liq_pump') {
+      badgeCls = 'sig-up';
+    } else if (sig.type === 'accumulation' || sig.type === 'wash_pump') {
+      badgeCls = 'sig-up sig-weak';
+    } else if (sig.type === 'strong_short' || sig.type === 'liq_dump') {
+      badgeCls = 'sig-down';
+    } else if (sig.type === 'distribution' || sig.type === 'wash_dump') {
+      badgeCls = 'sig-down sig-weak';
+    }
+
+    if (sig.type === 'none' || sig.score <= 0){
+      signalBox.innerHTML = `
+        <span class="small muted">
+          预测：无明显拉盘 / 砸盘结构
+          · Δ价 ${pc}%
+          · Δ名义 ${oc}%
+        </span>
+      `;
+      return;
+    }
+
+    signalBox.innerHTML = `
+      <div class="small" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">
+        <span class="sig-badge ${badgeCls}">
+          ${sig.label} · 评分 ${sig.score.toFixed(0)}
+        </span>
+        <span class="sig-badge sig-weak">
+          Δ价 ${pc}%
+        </span>
+        <span class="sig-badge sig-weak">
+          Δ名义 ${oc}%
+        </span>
+        <span class="sig-badge sig-weak">
+          大额买 ${sig.bigBuyCount} · 卖 ${sig.bigSellCount}
+        </span>
+      </div>
+      <div class="small muted">
+        ${sig.reasons.map(r=>`<div>${r}</div>`).join('')}
+      </div>
+    `;
+  }
+
+  /* ============ 绘制图表 ============ */
+  function drawChart(){
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.clearRect(0,0,W,H);
+
+    const merged = samples.concat(liveTail)
+      .map(s => ({ ...s, t:Number(s.t) }))
+      .filter(s => Number.isFinite(s.t));
+
+    if (!merged.length){
+      chartMeta.textContent = '无数据';
+      lastBuckets = [];
+      hoverIndex  = null;
+      if (signalBox) signalBox.innerHTML = '';
+      return;
+    }
+
+    const preset = aggSel.value || '5m';
+    const data   = bucketize(merged, preset);
+
+    if (data.length < 2){
+      chartMeta.textContent = '数据不足';
+      lastBuckets = data;
+      hoverIndex  = null;
+      return;
+    }
+
+    lastBuckets = data;
+    if (hoverIndex != null && (hoverIndex < 0 || hoverIndex >= data.length)){
+      hoverIndex = null;
+    }
+
+    const xs    = data.map(d=>d.t);
+    const nuArr = data.map(d=>d.nu);
+    const mpArr = data.map(d=>d.mp).filter(v=>Number.isFinite(v));
+
+    // 持仓量范围（右轴）
+    const nuMin = Math.min(...nuArr);
+    const nuMax = Math.max(...nuArr);
+
+    // 价格范围（左轴，可能没有）
+    const hasPrice = mpArr.length >= 2;
+    const mpMin    = hasPrice ? Math.min(...mpArr) : 0;
+    const mpMax    = hasPrice ? Math.max(...mpArr) : 1;
+
+    const xmin = Math.min(...xs);
+    const xmax = Math.max(...xs);
+    const span = xmax - xmin || 1;
+
+    const px = (t)=> PADL + (t-xmin)/span * (W-PADL-PADR);
+
+    // Y 轴比例
+    const nuSpan = (nuMax - nuMin) || 1;
+    const pyNU   = (v)=> H-PADB - (v - nuMin)/nuSpan * (H-PADT-PADB);
+
+    const mpSpan = (mpMax - mpMin) || 1;
+    const pyMP   = (v)=> H-PADB - (v - mpMin)/mpSpan * (H-PADT-PADB);
+
+    ctx.font = '12px system-ui';
+    ctx.lineWidth = 1;
+
+    /* ========= 左轴（价格） ========= */
+    if (hasPrice){
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.fillStyle   = '#4da3ff';     // 左轴文字：蓝色
+
+      for(let i=0;i<=4;i++){
+        const v = mpMin + (mpMax-mpMin)*i/4;
+        const y = pyMP(v);
+
+        ctx.beginPath();
+        ctx.moveTo(PADL, y);
+        ctx.lineTo(W-PADR, y);
+        ctx.stroke();
+
+        ctx.textAlign   = 'right';
+        ctx.textBaseline= 'middle';
+        ctx.fillText(v.toFixed(6), PADL-6, y);
+      }
+    }
+
+    /* ========= 右轴（持仓量） ========= */
+    ctx.fillStyle = '#9aa4b2';        // 右轴文字：灰色
+    for(let i=0;i<=4;i++){
+      const v = nuMin + (nuMax-nuMin)*i/4;
+      const y = pyNU(v);
+
+      ctx.textAlign   = 'left';
+      ctx.textBaseline= 'middle';
+      ctx.fillText(formatUSD(v), W-PADR+5, y);
+    }
+
+    /* ========= X 轴网格 ========= */
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    for(let i=0;i<=4;i++){
+      const tx = xmin + span*i/4;
+      const xx = px(tx);
+      ctx.beginPath();
+      ctx.moveTo(xx, PADT);
+      ctx.lineTo(xx, H-PADB);
+      ctx.stroke();
+
+      ctx.fillStyle = '#9aa4b2';
+      const label = formatTimeLabel(tx, span);
+      label.split('\n').forEach((ln,idx)=>{
+        ctx.textAlign   = 'center';
+        ctx.textBaseline= 'top';
+        ctx.fillText(ln, xx, H-PADB+6+idx*12);
+      });
+    }
+
+    /* ========= 持仓量折线（右轴） ========= */
+    ctx.strokeStyle = '#9aa4b2';      // 名义线颜色 = 右轴颜色
+    ctx.lineWidth   = 1.3;
+    ctx.beginPath();
+    data.forEach((d,i)=>{
+      const x = px(d.t), y = pyNU(d.nu);
+      if (i===0) ctx.moveTo(x,y);
+      else       ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+
+    /* ========= 价格折线（左轴） ========= */
+    if (hasPrice){
+      ctx.strokeStyle = '#4da3ff';    // 价格线颜色 = 左轴颜色
+      ctx.lineWidth   = 1.3;
+      ctx.beginPath();
+
+      data.forEach((d,i)=>{
+        if (!Number.isFinite(d.mp)) return;
+        const x=px(d.t), y=pyMP(d.mp);
+        if (i===0) ctx.moveTo(x,y);
+        else       ctx.lineTo(x,y);
+      });
+
+      ctx.stroke();
+    }
+
+    /* ========= 选中点：灰色十字虚线 + 双水平线 + 气泡 ========= */
+    if (hoverIndex != null && data[hoverIndex]){
+      const d = data[hoverIndex];
+
+      const xLine = px(d.t);              // 垂直线：当前时间桶
+      const yNu   = pyNU(d.nu);           // 水平线 1：名义持仓
+      const hasNu = Number.isFinite(d.nu);
+
+      const hasMpThis = hasPrice && Number.isFinite(d.mp);
+      const yMp       = hasMpThis ? pyMP(d.mp) : null; // 水平线 2：价格
+
+      // 计算气泡的锚点 Y：两条线中间 / 单线位置
+      let anchorY;
+      if (hasNu && hasMpThis){
+        anchorY = (yNu + yMp) / 2;
+      }else if (hasNu){
+        anchorY = yNu;
+      }else if (hasMpThis){
+        anchorY = yMp;
+      }else{
+        anchorY = (PADT + (H-PADB)) / 2;
+      }
+
+      // 十字虚线
+      ctx.save();
+      ctx.setLineDash([4,4]);
+      ctx.strokeStyle = 'rgba(148,163,184,0.8)';
+      ctx.lineWidth   = 1;
+
+      // 水平线：名义
+      if (hasNu){
+        ctx.beginPath();
+        ctx.moveTo(PADL, yNu);
+        ctx.lineTo(W-PADR, yNu);
+        ctx.stroke();
+      }
+
+      // 水平线：价格
+      if (hasMpThis){
+        ctx.beginPath();
+        ctx.moveTo(PADL, yMp);
+        ctx.lineTo(W-PADR, yMp);
+        ctx.stroke();
+      }
+
+      // 垂直线
+      ctx.beginPath();
+      ctx.moveTo(xLine, PADT);
+      ctx.lineTo(xLine, H-PADB);
+      ctx.stroke();
+
+      ctx.restore();
+
+      // —— 气泡文本 —— //
+      const timeText  = `时间 ${formatTooltipTime(d.t)}`;
+      const priceText = `价格 ${hasMpThis ? d.mp.toFixed(6) : '-'}`;
+      const nuText    = `名义 ${formatUSD(d.nu)} USDT`;
+      const lines     = [timeText, priceText, nuText];
+
+      ctx.font = '12px system-ui';
+      let maxW = 0;
+      for (const t of lines){
+        const w = ctx.measureText(t).width;
+        if (w > maxW) maxW = w;
+      }
+      const padX = 10, padY = 6, lh = 16;
+      const boxW = maxW + padX*2;
+      const boxH = lh*lines.length + padY*2;
+
+      // 智能水平位置：优先垂直线右侧，放不下再挪左
+      let boxX = xLine + 8;
+      if (boxX + boxW > W - PADR - 4){
+        boxX = xLine - 8 - boxW;
+        if (boxX < PADL + 4){
+          boxX = PADL + 4;
+        }
+      }
+
+      // 垂直位置：以 anchorY 为基准上下避让
+      let boxY = anchorY - boxH - 8;
+      if (boxY < PADT + 4){
+        boxY = anchorY + 8;
+      }
+      if (boxY + boxH > H - PADB - 4){
+        boxY = H - PADB - boxH - 4;
+      }
+
+      // 气泡背景
+      ctx.fillStyle   = 'rgba(15,23,42,0.96)';
+      ctx.strokeStyle = 'rgba(55,65,81,1)';
+      ctx.lineWidth   = 1;
+      if (ctx.roundRect){
+        ctx.beginPath();
+        ctx.roundRect(boxX, boxY, boxW, boxH, 6);
+        ctx.fill();
+        ctx.stroke();
+      }else{
+        ctx.beginPath();
+        ctx.rect(boxX, boxY, boxW, boxH);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      // 气泡文字
+      ctx.fillStyle   = '#e5e7eb';
+      ctx.textAlign   = 'left';
+      ctx.textBaseline= 'top';
+      lines.forEach((t,idx)=>{
+        ctx.fillText(t, boxX + padX, boxY + padY + idx*lh);
+      });
+    }
+
+    const d0 = data[0];
+    const d1 = data[data.length-1];
+    chartMeta.textContent =
+      `点数 ${data.length} · 粒度 ${preset} · Δ名义 ${(d1.nu-d0.nu).toFixed(2)} USDT`;
+
+    // 图重画完顺手刷新一下预测 UI
+    renderSignal();
+  }
+
+  /* ============ 拉历史 ============ */
+  async function reloadHistoryForCurrentSymbol(){
+    if (!curSymbol) return;
+
+    const preset    = aggSel.value || '5m';
+    const apiPeriod = PERIOD_FOR_API[preset];
+
+    const j = await getHistory(curSymbol, 500, apiPeriod);
+    samples = (j.samples||[]).map(s=>({
+      ...s,
+      t : Number(s.t),
+      nu: Number(s.nu ?? s.notionalUSD ?? s.oi ?? 0),
+      mp: Number(s.mp) || null
+    }));
+
+    liveTail = [];
+    predictor.reset();
+
+    // 用最后一笔做个 baseline
+    if (samples.length){
+      const last = samples[samples.length-1];
+      if (Number.isFinite(last.nu) && Number.isFinite(last.mp)){
+        predictor.pushSnapshot({
+          t    : last.t,
+          price: last.mp,
+          oi   : last.nu
+        });
+      }
+    }
+
+    drawChart();
+  }
+
+  /* ============ 关闭弹窗 ============ */
+  if (btnClose){
+    btnClose.addEventListener('click', () => {
+      drawer.classList.remove('open');
+
+      curSymbol = null;
+      samples   = [];
+      liveTail  = [];
+      chartMeta.textContent = '—';
+      lastBuckets = [];
+      hoverIndex  = null;
+      predictor.reset();
+      if (signalBox) signalBox.innerHTML = '';
+
+      if (autoTimer){
+        clearInterval(autoTimer);
+        autoTimer = null;
+      }
+    });
+  }
+
+  /* ============ 粒度切换 ============ */
+  if (aggSel){
+    aggSel.addEventListener('change', async ()=>{
+      try{
+        await reloadHistoryForCurrentSymbol();
+      }catch(e){
+        console.error('agg change reload failed', e);
+      }
+    });
+  }
+
+  /* ============ 点击交互：选择点 / 清除 ============ */
+  canvas.addEventListener('click', (ev)=>{
+    const rect   = canvas.getBoundingClientRect();
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+
+    const cx = (ev.clientX - rect.left) * scaleX;
+    const cy = (ev.clientY - rect.top)  * scaleY;
+
+    if (!lastBuckets || lastBuckets.length === 0){
+      hoverIndex = null;
+      drawChart();
+      return;
+    }
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // 点击在主绘图区外：关闭
+    if (cx < PADL || cx > W-PADR || cy < PADT || cy > H-PADB){
+      hoverIndex = null;
+      drawChart();
+      return;
+    }
+
+    const data = lastBuckets;
+    const xs   = data.map(d=>d.t);
+    const xmin = Math.min(...xs);
+    const xmax = Math.max(...xs);
+    const span = xmax - xmin || 1;
+
+    const tClick = xmin + (cx - PADL)/(W-PADL-PADR) * span;
+
+    let bestIdx  = 0;
+    let bestDist = Infinity;
+    for (let i=0;i<data.length;i++){
+      const dist = Math.abs(data[i].t - tClick);
+      if (dist < bestDist){
+        bestDist = dist;
+        bestIdx  = i;
+      }
+    }
+
+    hoverIndex = bestIdx;
     drawChart();
   });
 
-  btnClose.addEventListener('click', ()=>{
-    drawer.classList.remove('open');
-    curSymbol=null;
-    if(autoHistTimer){clearInterval(autoHistTimer); autoHistTimer=null;}
-    liveTail = [];
+  // 点击画布以外任意地方：关闭十字线和气泡
+  document.addEventListener('click', (ev)=>{
+    const path = ev.composedPath ? ev.composedPath() : [];
+    if (path.includes(canvas)) return;
+
+    if (hoverIndex != null){
+      hoverIndex = null;
+      drawChart();
+    }
   });
 
-  aggSel.addEventListener('change', ()=> drawChart());
-  if (biasSel) {
-    biasSel.addEventListener('change', ()=> drawChart());
-  }
-
-  function drawChart(){
-    const ctx=ctx2, W=canvas.width,H=canvas.height;
-    ctx.clearRect(0,0,W,H);
-
-    const allRaw = curSamples.concat(liveTail).filter(s=>Number.isFinite(s.t));
-    if(!allRaw.length){
-      chartMeta.textContent='暂无历史样本';
-      if(signalBox) signalBox.innerHTML='';
-      return;
-    }
-
-    const margin=getSpan()*0.2;
-    const windowRaw = allRaw.filter(s=>s.t>=(viewMin-margin)&&s.t<=(viewMax+margin));
-    const preset=aggSel.value;
-
-    const data = resampleBuckets(windowRaw, preset).filter(d=>d.t>=viewMin&&d.t<=viewMax);
-    if(data.length<2){
-      chartMeta.textContent='数据点不足';
-      if(signalBox) signalBox.innerHTML='';
-      return;
-    }
-
-    const xs=data.map(d=>d.t);
-    const nuVals=data.map(d=>d.nu).filter(Number.isFinite);
-    const mpVals=data.map(d=>d.mp).filter(Number.isFinite);
-
-    const xmin=Math.min(...xs), xmax=Math.max(...xs);
-    const nuMin=nuVals.length?Math.min(...nuVals):0, nuMax=nuVals.length?Math.max(...nuVals):1;
-    const mpMin=mpVals.length?Math.min(...mpVals):0, mpMax=mpVals.length?Math.max(...mpVals):1;
-
-    // 边框
-    ctx.strokeStyle='#1f2a40'; ctx.lineWidth=1;
-    ctx.beginPath();
-    ctx.moveTo(PADL,PADT); ctx.lineTo(PADL,H-PADB); ctx.lineTo(W-PADR,H-PADB);
-    ctx.moveTo(W-PADR,PADT); ctx.lineTo(W-PADR,H-PADB);
-    ctx.stroke();
-
-    // Y 轴网格/刻度（右轴=名义，左轴=价格）
-    ctx.fillStyle='#9aa4b2'; ctx.font='12px system-ui';
-    for(let i=0;i<=4;i++){
-      const v=nuMin+(nuMax-nuMin)*i/4; 
-      const y=mapYNu(v);
-      // 网格
-      ctx.strokeStyle='rgba(255,255,255,0.06)'; 
-      ctx.beginPath(); ctx.moveTo(PADL,y); ctx.lineTo(W-PADR,y); ctx.stroke();
-      // 右轴（名义）
-      ctx.fillText((v/1e6).toFixed(2)+'M', W-PADR+6, y+4);
-      // 左轴（价格）映射同一水平线
-      if (mpVals.length){
-        const pv = remap(v, nuMin, nuMax, mpMin, mpMax);
-        ctx.textAlign='right';
-        ctx.fillText(fmtPrice(pv), PADL-6, y+4);
-        ctx.textAlign='start';
-      }
-    }
-
-    // X 轴刻度
-    const PRESET_MS={'5m':300000,'15m':900000,'30m':1800000,'1h':3600000,'2h':7200000,'4h':14400000,'8h':28800000,'12h':43200000,'1d':86400000,'3d':259200000,'1w':604800000};
-    const stepMs=PRESET_MS[preset]; const span=(viewMax-viewMin)||1;
-    const approxTicks=Math.min(8,Math.max(3,Math.floor((W-PADL-PADR)/120)));
-    const tickStep=Math.max(stepMs,Math.ceil(span/approxTicks/stepMs)*stepMs);
-    const firstTick=Math.floor(viewMin/tickStep)*tickStep;
-    for(let t=firstTick;t<=viewMax;t+=tickStep){
-      const x=mapX(t);
-      ctx.strokeStyle='rgba(255,255,255,0.04)'; 
-      ctx.beginPath(); ctx.moveTo(x,PADT); ctx.lineTo(x,H-PADB); ctx.stroke();
-      ctx.fillText(formatTs(t,preset), x-32, H-PADB+18);
-    }
-
-    // 左轴：价格线
-    if (mpVals.length){
-      ctx.strokeStyle='#9be37d';
-      ctx.lineWidth=1.8; 
-      ctx.beginPath();
-      let first=true;
-      for(const d of data){
-        if (!Number.isFinite(d.mp)) continue;
-        const x=mapX(d.t), y=mapYPrice(d.mp);
-        if(first){ ctx.moveTo(x,y); first=false; } else ctx.lineTo(x,y);
-      }
-      ctx.stroke();
-    }
-
-    // 右轴：名义线
-    if (nuVals.length){
-      ctx.strokeStyle='#4da3ff';
-      ctx.lineWidth=2.2; 
-      ctx.beginPath();
-      let first=true;
-      for(const d of data){
-        if (!Number.isFinite(d.nu)) continue;
-        const x=mapX(d.t), y=mapYNu(d.nu);
-        if(first){ ctx.moveTo(x,y); first=false; } else ctx.lineTo(x,y);
-      }
-      ctx.stroke();
-    }
-
-    // 图例
-    ctx.fillStyle='#9aa4b2';
-    ctx.fillText('价格(左轴)', PADL, PADT-2);
-    ctx.fillText('名义(右轴)', PADL+90, PADT-2);
-
-    // meta
-    const lastNu = nuVals.at(-1), firstNu = nuVals[0];
-    const deltaNu = (Number.isFinite(lastNu)&&Number.isFinite(firstNu))? (lastNu-firstNu) : undefined;
-    const slopePerMin = (Number.isFinite(deltaNu)) ? deltaNu/Math.max(1,(xmax-xmin)/60000) : undefined;
-    const lastMp = mpVals.at(-1);
-    chartMeta.textContent = [
-      `点数：${data.length}`,
-      `粒度：${preset}`,
-      `窗口：${((viewMax-viewMin)/3600000).toFixed(1)}h`,
-      Number.isFinite(deltaNu) ? `Δ名义：$${(deltaNu/1e6).toFixed(2)}M` : '',
-      Number.isFinite(slopePerMin) ? `斜率：$${(slopePerMin/1e6).toFixed(2)}M/min` : '',
-      Number.isFinite(lastMp) ? `价格：${fmtPrice(lastMp)}` : ''
-    ].filter(Boolean).join(' · ');
-
-    // —— HTF 偏置 & 信号 —— //
-    const biasMode = biasSel ? (biasSel.value || 'off') : 'off';
-    const bias = computeHTFBias(curSamples.concat(liveTail), biasMode);
-    renderSignal(windowRaw, preset, bias);
-
-    /* ———— 内部工具函数 ———— */
-    function mapX(t){ return PADL + (W-PADL-PADR) * (t - viewMin) / (viewMax - viewMin || 1); }
-    function mapYNu(v){ return H-PADB - (H-PADT-PADB) * (v - nuMin) / ((nuMax - nuMin) || 1); }
-    function mapYPrice(v){ return H-PADB - (H-PADT-PADB) * (v - mpMin) / ((mpMax - mpMin) || 1); }
-    function remap(v, a1,b1,a2,b2){ if(b1===a1) return a2; const t=(v-a1)/(b1-a1); return a2 + (b2-a2)*Math.max(0,Math.min(1,t)); }
-    function fmtPrice(p){
-      if (p>=1000) return '$'+p.toLocaleString(undefined,{maximumFractionDigits:2});
-      if (p>=1)    return '$'+p.toLocaleString(undefined,{maximumFractionDigits:4});
-      return '$'+p.toLocaleString(undefined,{maximumFractionDigits:6});
-    }
-    function formatTs(t, preset){
-      const d = new Date(t);
-      const M = String(d.getMonth()+1).padStart(2,'0');
-      const D = String(d.getDate()).padStart(2,'0');
-      const Hh = String(d.getHours()).padStart(2,'0');
-      const Mi = String(d.getMinutes()).padStart(2,'0');
-      const total = viewMax - viewMin;
-      if (preset === '1w' || preset === '3d' || preset === '1d') return `${M}/${D}`;
-      if (preset.endsWith('h')) return `${M}/${D} ${Hh}:00`;
-      return total > 86400000 ? `${M}/${D} ${Hh}:${Mi}` : `${Hh}:${Mi}`;
-    }
-  }
-
-  function renderSignal(windowRaw, preset, bias){
-    if (!signalBox) return;
-
-    const edge = (key)=>{
-      let first, last;
-      for (let i=0;i<windowRaw.length;i++){
-        const v = windowRaw[i]?.[key];
-        if (Number.isFinite(v)){ first = v; break; }
-      }
-      for (let i=windowRaw.length-1;i>=0;i--){
-        const v = windowRaw[i]?.[key];
-        if (Number.isFinite(v)){ last = v; break; }
-      }
-      return [first,last];
-    };
-
-    const [p0,p1] = edge('mp');
-    const [o0,o1] = edge('oi');
-    const [n0,n1] = edge('nu');
-
-    const dP = (Number.isFinite(p0)&&Number.isFinite(p1)&&p0!==0) ? (p1/p0 - 1) : undefined;
-    const dO = (Number.isFinite(o0)&&Number.isFinite(o1)&&o0!==0) ? (o1/o0 - 1) : undefined;
-    const dN = (Number.isFinite(n0)&&Number.isFinite(n1)) ? (n1 - n0) : undefined;
-
-    const TH_P = 0.002; // 0.2%
-    const TH_O = 0.005; // 0.5%
-
-    if (!Number.isFinite(dP) || !Number.isFinite(dO)){
-      if (lastSignalHTML) signalBox.innerHTML = lastSignalHTML;
-      return;
-    }
-
-    let label = '观望/震荡', score = 0, cls = 'sig-badge sig-weak';
-    const upP = dP > TH_P, dnP = dP < -TH_P;
-    const upO = dO > TH_O, dnO = dO < -TH_O;
-
-    if (upP && upO){ label='顺势看多（延续）'; score=+2; cls='sig-badge sig-up'; }
-    else if (dnP && upO){ label='偏空（下跌增仓）'; score=-2; cls='sig-badge sig-down'; }
-    else if (upP && dnO){ label='多头回补/挤空'; score=+1; cls='sig-badge sig-up'; }
-    else if (dnP && dnO){ label='去杠杆/谨慎'; score=-1; cls='sig-badge sig-down'; }
-
-    let biasBadge = '';
-    if (bias && bias.mode !== 'off'){
-      const dirMap = { up:'多头偏置', down:'空头偏置', flat:'中性偏置' };
-      const biasText = `${dirMap[bias.dir]||'中性偏置'} · ${bias.mode.toUpperCase()}`;
-      biasBadge = `<span class="sig-badge">${biasText}（ΔP：${fmtPct(bias.dP)}）</span>`;
-
-      const shortUp  = score > 0;
-      const shortDown= score < 0;
-
-      if (bias.dir === 'up' && shortDown){
-        label = label.replace('偏空','逆势偏空').replace('谨慎','逆势谨慎');
-        score = Math.min(0, score+1);
-        cls = score<0 ? 'sig-badge sig-down' : 'sig-badge sig-weak';
-      }else if (bias.dir === 'down' && shortUp){
-        label = label.replace('看多','逆势看多').replace('挤空','逆势挤空');
-        score = Math.max(0, score-1);
-        cls = score>0 ? 'sig-badge sig-up' : 'sig-badge sig-weak';
-      }else if (bias.dir === 'up' && shortUp){
-        label = label.replace('顺势','顺势（HTF同向）');
-      }else if (bias.dir === 'down' && shortDown){
-        label = label.replace('谨慎','谨慎（HTF同向）').replace('偏空','偏空（HTF同向）');
-      }
-    }
-
-    const durH=((viewMax-viewMin)/3600000).toFixed(1);
-    const html = `
-      <span class="${cls}">${label}</span>
-      ${biasBadge}
-      <span class="sig-badge">窗口：${durH}h · 粒度：${preset}</span>
-      <span class="sig-badge">ΔPrice：${fmtPct(dP)}</span>
-      <span class="sig-badge">ΔOI：${fmtPct(dO)}</span>
-      <span class="sig-badge">Δ名义：${Number.isFinite(dN)? ('$'+(dN/1e6).toFixed(2)+'M') : '—'}</span>
-      <span class="sig-badge sig-weak">分数：${score}</span>
-    `;
-    signalBox.innerHTML = html;
-    lastSignalHTML = html;
-
-    function fmtPct(x){
-      if (!Number.isFinite(x)) return '—';
-      const v = (x*100);
-      const sign = v>0 ? '+' : '';
-      return sign + v.toFixed(2) + '%';
-    }
-  }
-
+  /* ============ 对外接口 ============ */
   return {
-    async open(symbol, loader){
-      if (!symbol) return;
-      curSymbol=symbol;
-      drawerTitle.textContent = symbol+' · 名义持仓（USD）历史';
+    async open(symbol){
+      curSymbol  = symbol;
+      liveTail   = [];
+      hoverIndex = null;
+      predictor.reset();
+
+      drawerTitle.textContent = `${symbol} · 名义持仓（USDT）`;
       drawer.classList.add('open');
 
-      const j = await loader(symbol);
-      curSamples = (j.samples||[]).filter(s=>Number.isFinite(s.nu) || Number.isFinite(s.mp) || Number.isFinite(s.oi));
-      const xs = curSamples.map(s=>s.t);
-      viewMin = xs.length?Math.min(...xs):Date.now()-3600e3;
-      viewMax = xs.length?Math.max(...xs):Date.now();
-      followTail = true;
-      liveTail=[]; 
-      lastSignalHTML = '';
-      drawChart();
+      await reloadHistoryForCurrentSymbol();
 
-      if (autoHistTimer) clearInterval(autoHistTimer);
-      autoHistTimer=setInterval(async ()=>{
-        if (!curSymbol) return;
-        const j2=await loader(curSymbol);
-        curSamples=(j2.samples||[]).filter(s=>Number.isFinite(s.nu) || Number.isFinite(s.mp) || Number.isFinite(s.oi));
-        drawChart();
-      }, 180000);
+      if (autoTimer) clearInterval(autoTimer);
+      autoTimer = setInterval(reloadHistoryForCurrentSymbol, 300000);
     },
-    // 实时只推名义；窗口信号会用“最近一次有 mp/oi 的点”计算
-    pushLive(nu,t){
-      if(!curSymbol || !Number.isFinite(nu)) return;
-      const tt=t||Date.now();
-      const last=liveTail[liveTail.length-1];
-      if(!last || last.t!==tt){
-        liveTail.push({t:tt,nu});
-        if(liveTail.length>500) liveTail.splice(0,liveTail.length-500);
-        if(followTail){
-          viewMax=tt; const span=getSpan(); viewMin=viewMax-span;
-        }
-        drawChart();
+
+    // pushLive：名义 + 价格 + 时间
+    pushLive(nu, price, t){
+      if (!curSymbol) return;
+      const ts   = Number(t)    || Date.now();
+      const nuN  = Number(nu)   || 0;
+      const mpN  = Number(price);
+      const mp   = Number.isFinite(mpN) ? mpN : null;
+
+      liveTail.push({ t: ts, nu: nuN, mp });
+      if (liveTail.length > 200) liveTail.shift();
+
+      if (mp !== null){
+        predictor.pushSnapshot({
+          t    : ts,
+          price: mp,
+          oi   : nuN
+        });
+      }
+
+      drawChart();
+    },
+
+    // WS 成交推给预测器
+    pushTrades(rows){
+      if (!curSymbol || !Array.isArray(rows)) return;
+
+      let any = false;
+      for (const it of rows){
+        if (!it || it.s !== curSymbol) continue;
+        const p  = Number(it.p);
+        const q  = Number(it.q);
+        const nu = Number(it.nu != null ? it.nu : (p * q));
+        const ts = Number(it.ts) || Date.now();
+        const m  = !!it.m; // true=卖出
+
+        if (!Number.isFinite(p) || !Number.isFinite(q) || !Number.isFinite(nu)) continue;
+
+        predictor.pushTrade({
+          t    : ts,
+          side : m ? 'sell' : 'buy',
+          quote: nu,
+          price: p
+        });
+        any = true;
+      }
+
+      if (any){
+        renderSignal();
       }
     }
   };

@@ -2,59 +2,72 @@
 import { fmt, fmtM$, el, loadFavSet, toggleFav } from './utils.js';
 import { humanWin } from './trend.js';
 
-// —— 状态（由 app.js 注入 openDrawer 等）—— //
+// —— 状态（由 app.js 注入 openDrawer / trendWins / trendMap）—— //
 export const state = {
-  sortKey: 'notional', // notional | mcap | win:xxx | symbol
-  sortDir: 'asc',
+  sortKey   : 'notional', // notional | mcap | win:xxx | symbol
+  sortDir   : 'asc',
   masterRows: [],
-  viewRows: [],
-  trendWins: [],
-  trendMap: null,
-  activeSym: null,
-  domIndex: new Map(),
+  viewRows  : [],
+  trendWins : [],         // [ms, ms, ...]
+  trendMap  : {},         // { [symbol]: { [ms]: { pct } } }
+  activeSym : null,
+  domIndex  : new Map(),
   openDrawer: () => {},
-  // ✅ 防重复绑定
-  _favBound: false,
+  _favBound : false,
   _copyBound: false
 };
 
 export function buildThead(){
   const thead = el('thead');
-  const cols = [
-    { key:'rank',     label:'#',                 w:64,  align:'left' },
-    { key:'symbol',   label:'合约',              w:128, align:'left', sortable:true },
-    { key:'price',    label:'标记价',            w:160 },
-    { key:'notional', label:'名义持仓（USD，M）', w:200, sortable:true },
-    // 动态趋势列插在 notional 后
-    { key:'fund',     label:'资金费率',          w:140 },
-    { key:'mcap',     label:'市值（USD，B/M）',  w:200, sortable:true }
+
+  // ✅ 顺序：# / 合约 / 名义持仓 / Δ列… / 资金费率 / 标记价 / 市值
+  const baseCols = [
+    { key:'rank',     label:'#',                         align:'left', w:50 },
+    { key:'symbol',   label:'合约',                      align:'left', sortable:true, w:140 },
+    { key:'notional', label:'名义持仓（USD，M）',         sortable:true, w:190 },
+    { key:'fund',     label:'资金费率',                  w:120 },
+    { key:'price',    label:'标记价',                    w:150 },
+    { key:'mcap',     label:'市值（USD，B/M）',          sortable:true, w:180 }
   ];
-  const trendCols = (state.trendWins||[]).map(ms=>({
-    key:`win:${ms}`, label:`Δ${humanWin(ms)}（M / %）`, w:180, sortable:true
+
+  // 中间插入：根据 trendWins 动态生成 “Δ持仓 xx（%）”
+  const trendCols = (state.trendWins || []).map(ms => ({
+    key     : `win:${ms}`,
+    label   : `Δ持仓 ${humanWin(ms)}（%）`,
+    sortable: true,
+    w       : 150
   }));
-  const all = [...cols.slice(0,4), ...trendCols, ...cols.slice(4)];
+
+  const cols = [
+    ...baseCols.slice(0, 3),   // #, 合约, 名义
+    ...trendCols,              // Δ列
+    ...baseCols.slice(3)       // 资金费率, 标记价, 市值
+  ];
 
   let html = '<tr>';
-  all.forEach(c=>{
-    const cls = c.sortable ? ' class="sortable"' : '';
-    const arrow = (c.sortable && state.sortKey===c.key) ? `<span class="arrow">${state.sortDir==='asc'?'↑':'↓'}</span>` : '';
-    html += `<th${cls} data-key="${c.key}" style="text-align:${c.align||'right'}">${c.label}${arrow}</th>`;
+  cols.forEach(c => {
+    const sortable = !!c.sortable;
+    const cls   = sortable ? ' class="sortable"' : '';
+    const arrow = (sortable && state.sortKey === c.key)
+      ? `<span class="arrow">${state.sortDir === 'asc' ? '↑' : '↓'}</span>` : '';
+    const wStyle = c.w ? `;width:${c.w}px;min-width:${c.w}px` : '';
+    html += `<th${cls} data-key="${c.key}" style="text-align:${c.align||'right'}${wStyle}">${c.label}${arrow}</th>`;
   });
   html += '</tr>';
   thead.innerHTML = html;
 
-  thead.querySelectorAll('.sortable').forEach(th=>{
+  thead.querySelectorAll('.sortable').forEach(th => {
     th.addEventListener('click', ()=>{
       const k = th.getAttribute('data-key');
-      if (state.sortKey===k){
-        state.sortDir = (state.sortDir==='asc')?'desc':'asc';
+      if (state.sortKey === k){
+        state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
       }else{
         state.sortKey = k;
-        if (k==='notional') state.sortDir='asc';
-        else if (k==='mcap') state.sortDir='desc';
-        else if (k.startsWith('win:')) state.sortDir='desc';
-        else if (k==='symbol') state.sortDir='asc';
-        else state.sortDir='asc';
+        if (k === 'notional') state.sortDir = 'asc';
+        else if (k === 'mcap') state.sortDir = 'desc';
+        else if (k === 'symbol') state.sortDir = 'asc';
+        else if (k.startsWith('win:')) state.sortDir = 'desc'; // 百分比默认从大到小
+        else state.sortDir = 'asc';
       }
       buildThead();
       applyFiltersAndRender();
@@ -77,65 +90,83 @@ function parseSymFilter(){
 }
 
 export function applyFiltersAndRender(){
-  const minStr = el('minUSD').value;
-  const maxStr = el('maxUSD').value;
-  const onlyFav = !!(el('onlyFav') && el('onlyFav').checked);
-  const favSet = loadFavSet();
-  const tokens = parseSymFilter();
-  const noRange = (minStr === '' && maxStr === '');
-  const minUSD = noRange ? -Infinity : Number(minStr);
-  const maxUSD = noRange ?  Infinity : Number(maxStr);
+  const minStrEl = el('minUSD');
+  const maxStrEl = el('maxUSD');
 
-  // 基础过滤：关注/名义区间/合约名包含
-  const base = (state.masterRows||[]).filter(r=>{
+  const minStr  = minStrEl ? minStrEl.value : '';
+  const maxStr  = maxStrEl ? maxStrEl.value : '';
+  const onlyFav = !!(el('onlyFav') && el('onlyFav').checked);
+  const favSet  = loadFavSet();
+  const tokens  = parseSymFilter();
+
+  // ✅ 默认都是“不限”
+  let minUSD = -Infinity;
+  let maxUSD =  Infinity;
+
+  if (minStr !== ''){
+    const v = Number(minStr);
+    if (Number.isFinite(v)) minUSD = v;
+  }
+  if (maxStr !== ''){
+    const v = Number(maxStr);
+    if (Number.isFinite(v)) maxUSD = v;
+  }
+
+  const base = (state.masterRows || []).filter(r=>{
     if (!r || !r.symbol) return false;
 
     if (onlyFav && !favSet.has(String(r.symbol).toUpperCase())) return false;
 
-    if (!noRange){
-      const v = Number(r.notionalUSD);
-      if (!Number.isFinite(v) || v < minUSD || v > maxUSD) return false;
-    }
+    // 名义区间过滤
+    const v = Number(r.notionalUSD);
+    if (!Number.isFinite(v) || v < minUSD || v > maxUSD) return false;
 
+    // 合约名过滤
     if (tokens.length){
       const sym = String(r.symbol).toUpperCase();
       let hit = false;
-      for (const tk of tokens){ if (sym.includes(tk)) { hit = true; break; } }
+      for (const tk of tokens){
+        if (sym.includes(tk)) { hit = true; break; }
+      }
       if (!hit) return false;
     }
 
     return true;
   });
 
-  // 排序
   const rows = base.slice();
   rows.sort((a,b)=>{
-    const dir = state.sortDir==='asc' ? 1 : -1;
+    const dir = state.sortDir === 'asc' ? 1 : -1;
 
-    if (state.sortKey==='symbol'){
+    if (state.sortKey === 'symbol'){
       const sa = String(a.symbol||'');
       const sb = String(b.symbol||'');
       return dir * sa.localeCompare(sb, 'en', { sensitivity:'base' });
     }
 
-    if (state.sortKey==='notional'){
+    if (state.sortKey === 'notional'){
       const va = Number.isFinite(a.notionalUSD)?a.notionalUSD:(state.sortDir==='asc'?+Infinity:-Infinity);
       const vb = Number.isFinite(b.notionalUSD)?b.notionalUSD:(state.sortDir==='asc'?+Infinity:-Infinity);
       return state.sortDir==='asc' ? (va-vb) : (vb-va);
     }
 
-    if (state.sortKey==='mcap'){
+    if (state.sortKey === 'mcap'){
       const va = Number.isFinite(a.marketCapUSD)?a.marketCapUSD:(state.sortDir==='asc'?+Infinity:-Infinity);
       const vb = Number.isFinite(b.marketCapUSD)?b.marketCapUSD:(state.sortDir==='asc'?+Infinity:-Infinity);
       return state.sortDir==='asc' ? (va-vb) : (vb-va);
     }
 
-    if (state.sortKey.startsWith('win:') && state.trendMap){
-      const key = Number(state.sortKey.split(':')[1]);
-      const ta = state.trendMap[a.symbol]?.wins?.[key]?.delta ?? (state.sortDir==='desc'?-Infinity:+Infinity);
-      const tb = state.trendMap[b.symbol]?.wins?.[key]?.delta ?? (state.sortDir==='desc'?-Infinity:+Infinity);
-      return state.sortDir==='desc' ? (tb-ta) : (ta-tb);
+    if (state.sortKey.startsWith('win:')){
+      const keyMs = Number(state.sortKey.split(':')[1]);
+      const ta    = state.trendMap[a.symbol]?.[keyMs]?.pct;
+      const tb    = state.trendMap[b.symbol]?.[keyMs]?.pct;
+
+      const va = Number.isFinite(ta) ? ta : (state.sortDir==='desc'?-Infinity:+Infinity);
+      const vb = Number.isFinite(tb) ? tb : (state.sortDir==='desc'?-Infinity:+Infinity);
+
+      return state.sortDir==='asc' ? (va-vb) : (vb-va);
     }
+
     return 0;
   });
 
@@ -143,14 +174,18 @@ export function applyFiltersAndRender(){
   render();
 
   const tokText = tokens.length ? ` · 过滤：${tokens.join(' | ')}` : '';
+  const total   = state.masterRows ? state.masterRows.length : 0;
   el('meta').textContent =
-    `合约数：${state.viewRows.length} / ${state.masterRows.length} · 排序：${state.sortKey} ${state.sortDir} · 趋势列：${(state.trendWins||[]).map(humanWin).join(', ')||'无'}${onlyFav?' · 仅显示关注':''}${tokText}`;
+    `合约数：${state.viewRows.length} / ${total}`
+    + ` · 排序：${state.sortKey} ${state.sortDir}`
+    + ` · 趋势列：${(state.trendWins||[]).map(humanWin).join(', ')||'无'}`
+    + (onlyFav?' · 仅显示关注':'')
+    + tokText;
 }
 
 export function render(){
   buildThead();
 
-  // 重置 tbody 内容（不移除节点本身，保留一次性绑定的委托）
   const tbody = el('tbody'); tbody.innerHTML='';
   state.domIndex = new Map();
   const favSet = loadFavSet();
@@ -168,6 +203,7 @@ export function render(){
         </svg>
       </button>`;
 
+    // ✅ 行内顺序：# / 合约 / 名义 / Δ列… / 资金费率 / 标记价 / 市值
     let html = `
       <td class="num" style="text-align:left">${i+1}</td>
       <td style="text-align:left">
@@ -176,39 +212,48 @@ export function render(){
           <span class="badge copy" data-sym="${r.symbol}" title="点击复制">${r.symbol}</span>
         </span>
       </td>
-      <td class="num">${Number.isFinite(r.markPrice)? '$'+fmt(r.markPrice): '-'}</td>
       <td class="num"><b>${fmtM$(r.notionalUSD)}</b></td>
     `;
 
-    if (state.trendWins && state.trendMap){
-      const trow = state.trendMap[r.symbol];
-      for (const ms of state.trendWins){
-        const w = trow?.wins?.[ms] || null;
-        if (!w || !Number.isFinite(w.delta) || !Number.isFinite(w.pct)){
-          html += `<td class="num muted">—</td>`;
-        }else{
-          const cls = w.delta>=0 ? 'delta-pos' : 'delta-neg';
-          html += `<td class="num ${cls}">${(w.delta/1e6).toFixed(2)}M (${(w.pct*100).toFixed(2)}%)</td>`;
-        }
+    // —— 动态窗口：每列只显示百分比 —— //
+    const trendRow = state.trendMap[r.symbol] || {};
+    for (const ms of state.trendWins || []){
+      const info = trendRow[ms] || null;
+      const pct  = info && Number.isFinite(info.pct) ? info.pct * 100 : NaN;
+      if (!Number.isFinite(pct)){
+        html += `<td class="num muted">—</td>`;
+      }else{
+        const cls = pct >= 0 ? 'delta-pos' : 'delta-neg';
+        html += `<td class="num ${cls}">${pct.toFixed(2)}%</td>`;
       }
     }
 
     html += `
-      <td class="num">${r.fundingRate==null?'-': (r.fundingRate>=0?'+':'')+Number(r.fundingRate).toLocaleString(undefined,{maximumFractionDigits:4})+'%'}</td>
+      <td class="num">${r.fundingRate==null
+        ?'-'
+        : (r.fundingRate>=0?'+':'')+Number(r.fundingRate).toLocaleString(undefined,{maximumFractionDigits:4})+'%'}</td>
+      <td class="num">${Number.isFinite(r.markPrice)? '$'+fmt(r.markPrice): '-'}</td>
       <td class="num">${renderMcapCell(r.marketCapUSD)}</td>
     `;
     tr.innerHTML = html;
     tbody.appendChild(tr);
     state.domIndex.set(r.symbol, tr);
 
-    // 行点击：打开抽屉（避免与星标/复制点击冲突）
+    // —— 行点击：打开抽屉；如果当前行对应的弹窗已经打开，就不再重复执行 —— //
     tr.addEventListener('click', (ev)=>{
       if (ev.target.closest('.fav-btn') || ev.target.closest('.badge.copy')) return;
+
+      const drawer = el('drawer');
+      if (state.activeSym === r.symbol && drawer?.classList.contains('open')){
+        // 当前这行已经是激活合约，且抽屉是打开状态，不需要重复 openDrawer
+        return;
+      }
+
       state.openDrawer(r.symbol);
     });
   }
 
-  // ✅ 复制委托：只绑定一次在 table 上
+  // 复制委托：只绑定一次
   if (!state._copyBound) {
     document.querySelector('table').addEventListener('click', async (e)=>{
       const elBadge = e.target.closest('.badge.copy'); if(!elBadge) return;
@@ -228,13 +273,13 @@ export function render(){
     state._copyBound = true;
   }
 
-  // ✅ 星标委托：只绑定一次在 tbody 上
+  // 星标委托：只绑定一次
   if (!state._favBound) {
     el('tbody').addEventListener('click', (e)=>{
       const btn = e.target.closest('.fav-btn'); if(!btn) return;
       e.stopPropagation();
       const sym = btn.getAttribute('data-sym');
-      const on = toggleFav(sym);
+      const on  = toggleFav(sym);
       btn.classList.toggle('active', on);
       btn.title = on ? '取消关注' : '关注';
       if (el('onlyFav')?.checked) applyFiltersAndRender();
@@ -244,7 +289,7 @@ export function render(){
 }
 
 export function setActiveRow(sym){
-  state.activeSym=sym;
+  state.activeSym = sym;
   document.querySelectorAll('#tbody tr.row-active').forEach(tr=>tr.classList.remove('row-active'));
-  const tr=state.domIndex.get(sym); if(tr) tr.classList.add('row-active');
+  const tr = state.domIndex.get(sym); if (tr) tr.classList.add('row-active');
 }

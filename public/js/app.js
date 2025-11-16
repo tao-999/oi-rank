@@ -1,94 +1,113 @@
 // public/js/app.js
 import { el } from './utils.js';
-import { getProgress, getSnapshot, getTrends, getHistory } from './api.js';
-import { parseWins, humanWin } from './trend.js';
+import { getProgress, getSnapshot } from './api.js';
 import { state, buildThead, applyFiltersAndRender, setActiveRow } from './table.js';
 import { createChart } from './chart.js';
 import { createWS } from './ws.js';
-import { createTradesPanel } from './trades.js';   // ✅ 接入成交面板
+import { createTradesPanel } from './trades.js';
 
-let timer = null, resortTimer = null, needResort = false;
+let timer       = null;
+let resortTimer = null;
+let needResort  = false;
 
-const chart = createChart();
-const tradesPanel = createTradesPanel();
-let wsClient = null;   // 保存 createWS 返回的对象
+const chart        = createChart();
+const tradesPanel  = createTradesPanel();
+let   wsClient     = null;
 
-// 给 table 模块一个打开抽屉的方法
-state.openDrawer = async (symbol) => {
+// ===== 打开抽屉查看单个合约 =====
+state.openDrawer = async (symbol)=>{
   setActiveRow(symbol);
 
-  // 告诉后端：当前我要看的成交是这个 symbol
-  if (wsClient) {
+  if (wsClient){
     wsClient.subTrades(symbol);
   }
-
-  // 告诉成交面板当前 symbol
-  if (tradesPanel) {
+  if (tradesPanel){
     tradesPanel.setSymbol(symbol);
   }
 
-  await chart.open(symbol, (s) => getHistory(s, 20000));
+  await chart.open(symbol);
 };
 
-function setStatus(text){ el('state').innerHTML = text; }
+function setStatus(text){
+  const s = el('state');
+  if (s) s.innerHTML = text;
+}
 
+// ===== 启动：等后端完成 bootstrap =====
 async function waitBootThenStart(){
   const overlay = el('overlay');
-  const bar = el('barFill');
-  const ovText = el('ovText');
-  const ovPct  = el('ovPct');
+  const bar     = el('barFill');
+  const ovText  = el('ovText');
+  const ovPct   = el('ovPct');
 
-  while(true){
+  while (true){
     try{
-      const j = await getProgress();
-      const total = Number(j.total||0), done = Number(j.done||0);
-      const ratio = Math.max(0, Math.min(1, total ? done/total : (j.bootReady ? 1 : 0)));
-      if (bar)   bar.style.width = (ratio*100).toFixed(0) + '%';
-      if (ovPct) ovPct.textContent = (ratio*100).toFixed(0) + '%';
-      if (ovText) {
-        ovText.textContent = j.bootReady ? '完成，正在载入表格…' : `抓取合约数据：${done}/${total}`;
+      const j     = await getProgress();
+      const total = Number(j.total || 0);
+      const done  = Number(j.done  || 0);
+      const ratio = total ? (done / total) : (j.bootReady ? 1 : 0);
+
+      if (bar)   bar.style.width   = (ratio * 100).toFixed(0) + '%';
+      if (ovPct) ovPct.textContent = (ratio * 100).toFixed(0) + '%';
+
+      if (ovText){
+        ovText.textContent = j.bootReady
+          ? '完成，正在载入表格…'
+          : `抓取合约数据：${done}/${total}`;
       }
+
       if (j.bootReady) break;
-    }catch{
+    }catch(e){
       if (ovText) ovText.textContent = '等待服务就绪…';
     }
     await new Promise(r => setTimeout(r, 1000));
   }
 
   if (overlay) overlay.style.display = 'none';
+
   await refreshAllOnce();
   connectWS();
+
   if (timer) clearInterval(timer);
-  timer = setInterval(refreshAllOnce, 1000*1000);
+  timer = setInterval(refreshAllOnce, 1000 * 1000);
 }
 
+// ===== 快照刷新（含趋势窗口的增量） =====
 async function refreshAllOnce(){
   setStatus('<span class="spin"></span> 加载快照…');
-  const snap = await getSnapshot();
+
+  const winsInput = el('wins');
+  const winsStr   = winsInput ? winsInput.value.trim() : '';
+
+  const snap = await getSnapshot(winsStr);
+
   state.masterRows = snap.rows || [];
+  state.trendWins  = Array.isArray(snap.winsMs) ? snap.winsMs : [];
+  state.trendMap   = {};
+
+  for (const row of state.masterRows){
+    if (!row || !row.symbol) continue;
+    state.trendMap[row.symbol] = row.trend || {};
+  }
+
   setStatus('完成');
-  await refreshTrendsFromInput();
-  buildThead(); 
+
+  buildThead();
   applyFiltersAndRender();
 }
 
-async function refreshTrendsFromInput(){
-  const winsInput = el('wins');
-  state.trendWins = parseWins(winsInput ? winsInput.value : '');
-  if (!state.trendWins.length){ state.trendMap = null; return; }
-  const labels = state.trendWins.map(humanWin).join(',');
-  const j = await getTrends(labels);
-  state.trendMap = j.data || null;
-}
-
+// ===== WebSocket：实时价格 / 资金费率 / 名义 =====
 function connectWS(){
   wsClient = createWS(
-    // init：一次性快照
+    // init 快照修正
     (map)=>{
       if (!Array.isArray(state.masterRows)) return;
-      const by = new Map(state.masterRows.map(r=>[r.symbol,r]));
+      const by = new Map(state.masterRows.map(r => [r.symbol, r]));
+
       for (const sym in map){
-        const row = by.get(sym); if (!row) continue;
+        const row = by.get(sym);
+        if (!row) continue;
+
         const p = map[sym];
         if (Number.isFinite(p.p)){
           row.markPrice = p.p;
@@ -99,14 +118,19 @@ function connectWS(){
         if (p.r != null) row.fundingRate = p.r;
         row.updatedAt = p.u || row.updatedAt || row.time;
       }
-      // 局部 DOM 刷新：只更新价格/名义
+
       partialPriceRefresh(by);
     },
-    // delta：价格/资金费率增量
+
+    // delta 增量
     (changed)=>{
-      const by = new Map(state.masterRows.map(r=>[r.symbol,r])); let touched = 0;
+      const by = new Map(state.masterRows.map(r => [r.symbol, r]));
+      let touched = 0;
+
       for (const it of changed){
-        const row = by.get(it.s); if (!row) continue;
+        const row = by.get(it.s);
+        if (!row) continue;
+
         if (Number.isFinite(it.p)){
           row.markPrice = it.p;
           if (Number.isFinite(row.openInterest)){
@@ -116,28 +140,36 @@ function connectWS(){
         }
         if (it.r != null) row.fundingRate = it.r;
         row.updatedAt = it.u || row.updatedAt || row.time;
-        // 推一笔到图表（只有当前打开的才推进）
-        if (row.symbol === state.activeSym && Number.isFinite(row.notionalUSD)) {
-          chart.pushLive(row.notionalUSD, row.updatedAt);
+
+        // ✅ 当前激活合约：把名义 + 价格 + 时间喂给 chart（用于图 + 预测）
+        if (
+          row.symbol === state.activeSym &&
+          Number.isFinite(row.notionalUSD) &&
+          Number.isFinite(row.markPrice)
+        ){
+          chart.pushLive(row.notionalUSD, row.markPrice, row.updatedAt);
         }
       }
+
       if (touched){
-        partialPriceRefresh(by); needResort = true;
+        partialPriceRefresh(by);
+        needResort = true;
         if (!resortTimer){
           resortTimer = setTimeout(()=>{
             if (needResort) applyFiltersAndRender();
-            needResort = false; resortTimer = null;
+            needResort  = false;
+            resortTimer = null;
           }, 3000);
         }
       }
     },
-    // trades：最新成交增量（从后端 /ws -> 图表 + 成交表）
+
+    // trades
     (trades)=>{
-      // ✅ chart 模块没实现 pushTrades 也不会报错
-      if (chart && typeof chart.pushTrades === 'function') {
+      if (chart && typeof chart.pushTrades === 'function'){
         chart.pushTrades(trades);
       }
-      if (tradesPanel) {
+      if (tradesPanel){
         tradesPanel.pushTrades(trades);
       }
     }
@@ -145,45 +177,53 @@ function connectWS(){
 }
 
 function partialPriceRefresh(by){
-  by.forEach((row,sym)=>{
-    const tr = state.domIndex.get(sym); if(!tr) return;
-    // 列：0序号 1合约 2标记价 3名义 4..趋势.. 末尾 资金/市值
-    const pc = tr.children[2], nc = tr.children[3];
-    if (pc && Number.isFinite(row.markPrice)) {
-      pc.innerHTML = '$'+Number(row.markPrice).toLocaleString(undefined,{maximumFractionDigits:6});
+  by.forEach((row, sym)=>{
+    const tr = state.domIndex.get(sym);
+    if (!tr) return;
+
+    const nTrend = (state.trendWins || []).length;
+
+    // 当前行的列顺序：
+    // 0:#  1:合约  2:名义  3..(2+nTrend): Δ列
+    // 3+nTrend: 资金费率  4+nTrend: 标记价  5+nTrend: 市值
+    const notionalIdx = 2;
+    const priceIdx    = 4 + nTrend;
+
+    const nc = tr.children[notionalIdx];
+    const pc = tr.children[priceIdx];
+
+    if (pc && Number.isFinite(row.markPrice)){
+      pc.innerHTML = '$' + Number(row.markPrice)
+        .toLocaleString(undefined, { maximumFractionDigits: 6 });
     }
-    if (nc && Number.isFinite(row.notionalUSD)) {
-      nc.innerHTML = '<b>'+((row.notionalUSD/1e6).toFixed(2)+'M')+'</b>';
+    if (nc && Number.isFinite(row.notionalUSD)){
+      nc.innerHTML = '<b>' + (row.notionalUSD / 1e6).toFixed(2) + 'M</b>';
     }
   });
 }
 
-// ===== 事件 =====
-['minUSD','maxUSD'].forEach(id=> {
+// ===== 过滤 / 事件 =====
+['minUSD','maxUSD'].forEach(id=>{
   const input = el(id);
   if (input) input.addEventListener('input', ()=> applyFiltersAndRender());
 });
 
-const winsInput = el('wins');
-if (winsInput) {
-  winsInput.addEventListener('change', async ()=>{
-    await refreshTrendsFromInput(); 
-    buildThead(); 
-    applyFiltersAndRender();
-  });
-}
-
 // “只看关注”
 const onlyFavEl = el('onlyFav');
-if (onlyFavEl) {
+if (onlyFavEl){
   onlyFavEl.addEventListener('change', ()=> applyFiltersAndRender());
 }
 
-// 合约名过滤（即时过滤）
+// 合约名过滤
 const symFilterInput = el('symFilter');
-if (symFilterInput) {
+if (symFilterInput){
   symFilterInput.addEventListener('input', ()=> applyFiltersAndRender());
 }
 
-// 启动
+// 趋势窗口变化：重新拉一次快照（带新的 wins）
+const winsInput = el('wins');
+if (winsInput){
+  winsInput.addEventListener('change', ()=> refreshAllOnce());
+}
+
 window.addEventListener('DOMContentLoaded', waitBootThenStart);

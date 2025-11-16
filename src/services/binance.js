@@ -1,347 +1,302 @@
 // src/services/binance.js
-const fetch = global.fetch || require('node-fetch'); // Node18 内置 fetch；老版本兜底
+const fetch     = global.fetch || require('node-fetch');
 const WebSocket = require('ws');
+
 const { FAPI, ENDPT } = require('../config');
 const {
   BOOK,
   SYMBOLS,
   setSYMBOLS,
-  histPush,
-  appendNDJSON,
-  readHistoryMerged,
-  BOOT_READY,
-  setBOOT,
-  OI_PROGRESS,
-  setOISweep,
+  appendTradeNDJSON,
   now,
-  appendTradeNDJSON,   // ✅ 启用成交 ndjson 写入
+  OI_PROGRESS,
+  setBOOT,
+  setOIHist,
+  saveOIHistToFile
 } = require('../store');
 
-// 避免循环依赖：拿整个 ws 总线对象，不解构
 const wsBus = require('../ws');
 
-let wsBinance = null, wsMsgCount = 0, wsLastBeat = 0, reconnectDelay = 3000;
+// ========== 通用安全请求 ==========
 
-// ====== 成交 WS：单合约流 ======
-let wsTrades = null;
-let tradesLastBeat = 0;
-let tradesReconnectDelay = 3000;
-let tradesSymbol = null;
-
-// 每个 symbol 在内存里保留最近 10 万条（给前端表格用）
-const MAX_TRADES_PER_SYM = 100000;
-const RECENT_TRADES = new Map(); // Map<symbol, Array<trade>>
-
-function pushRecentTrade(sym, t) {
-  let arr = RECENT_TRADES.get(sym);
-  if (!arr) { arr = []; RECENT_TRADES.set(sym, arr); }
-  arr.push(t);
-  if (arr.length > MAX_TRADES_PER_SYM) {
-    arr.splice(0, arr.length - MAX_TRADES_PER_SYM);
-  }
-}
-
-function getRecentTrades(sym) {
-  return RECENT_TRADES.get(sym) || [];
-}
-
-// ================== 通用 REST ==================
-async function safeJSON(url) {
-  const r = await fetch(url, { cache: 'no-store' });
-  if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+async function safeJSON(url){
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   return r.json();
 }
 
-async function listUSDTPerpSymbols() {
-  try {
-    const ex = await safeJSON(FAPI + ENDPT.exchangeInfo);
-    const list = (ex.symbols || [])
-      .filter(s => s.contractType === 'PERPETUAL')
-      .filter(s => s.quoteAsset === 'USDT' && s.marginAsset === 'USDT')
-      .filter(s => s.status === 'TRADING')
-      .map(s => s.symbol);
-    if (list.length) return list;
-  } catch { }
+// ========== 拉 USDT 永续列表 ==========
 
-  const arr = await safeJSON(FAPI + ENDPT.tickers);
-  return arr.map(x => x.symbol).filter(s => !s.includes('_') && s.endsWith('USDT'));
+async function listUSDTPerpSymbols(){
+  const ex = await safeJSON(FAPI + ENDPT.exchangeInfo);
+  return (ex.symbols || [])
+    .filter(s => s.contractType === 'PERPETUAL')
+    .filter(s => s.quoteAsset   === 'USDT')
+    .filter(s => s.marginAsset  === 'USDT')
+    .filter(s => s.status       === 'TRADING')
+    .map(s => s.symbol);
 }
 
-async function refreshPremiumAll() {
+// ========== premiumAll：价格 + 资金费率快照 ==========
+
+async function refreshPremiumAll(){
   const arr = await safeJSON(FAPI + ENDPT.premiumAll);
-  const t = now();
-  for (const it of arr) {
+  const t   = now();
+
+  for (const it of arr){
     const sym = it.symbol;
-    if (!sym || sym.includes('_') || !sym.endsWith('USDT')) continue;
-    const mp = Number(it.markPrice); if (!Number.isFinite(mp)) continue;
-    const fr = (it.lastFundingRate != null) ? Number(it.lastFundingRate) * 100 : null;
-    const prev = BOOK.get(sym) || { symbol: sym, openInterest: NaN, fundingRate: null, markPrice: NaN, notionalUSD: NaN };
-    const notional = Number.isFinite(prev.openInterest) ? prev.openInterest * mp : NaN;
+    if (!sym.endsWith('USDT')) continue;
+
+    const mp = Number(it.markPrice);
+    if (!Number.isFinite(mp)) continue;
+
+    const fr   = it.lastFundingRate != null ? Number(it.lastFundingRate) * 100 : null;
+    const prev = BOOK.get(sym) || {};
+    const oi   = prev.openInterest;
+
+    const notional = (Number.isFinite(oi) && Number.isFinite(mp)) ? oi * mp : NaN;
+
     BOOK.set(sym, {
-      symbol: sym,
-      markPrice: mp,
-      fundingRate: fr ?? prev.fundingRate,
-      openInterest: prev.openInterest,
-      notionalUSD: notional,
-      time: prev.time || it.time || t,
-      updatedAt: t
+      symbol      : sym,
+      markPrice   : mp,
+      fundingRate : fr ?? prev.fundingRate,
+      openInterest: oi,
+      notionalUSD : notional,
+      updatedAt   : t
     });
   }
 }
 
-async function refreshOpenInterestAll({ conc = 8, sleepMs = 60, trackProgress = false } = {}) {
+// ========== 实时 openInterest：只保留当前值，不落盘 ==========
+
+async function refreshOpenInterestAll(){
   const syms = SYMBOLS();
-  if (!syms.length) return 0;
-  let i = 0, ok = 0;
-  if (trackProgress) { OI_PROGRESS.total = syms.length; OI_PROGRESS.done = 0; }
+  OI_PROGRESS.total = syms.length;
+  OI_PROGRESS.done  = 0;
 
-  async function worker() {
-    while (i < syms.length) {
-      const sym = syms[i++];
-      try {
-        const j = await safeJSON(FAPI + ENDPT.openInterest + encodeURIComponent(sym));
-        const oi = Number(j.openInterest);
-        const t = j.time || now();
-        const prev = BOOK.get(sym) || { symbol: sym, markPrice: NaN, fundingRate: null };
-        const mp = prev.markPrice;
-        const notional = (Number.isFinite(oi) && Number.isFinite(mp)) ? oi * mp : NaN;
+  for (const sym of syms){
+    try{
+      const j  = await safeJSON(FAPI + ENDPT.openInterest + encodeURIComponent(sym));
+      const oi = Number(j.openInterest);
+      const prev = BOOK.get(sym) || {};
+      const mp   = prev.markPrice;
 
-        const row = {
-          symbol: sym,
-          markPrice: mp,
-          fundingRate: prev.fundingRate,
-          openInterest: oi,
-          notionalUSD: notional,
-          time: t,
-          updatedAt: now()
-        };
-        BOOK.set(sym, row); ok++;
-
-        if (Number.isFinite(oi)) {
-          const sample = {
-            t,
-            oi,
-            mp: Number.isFinite(mp) ? mp : null,
-            nu: Number.isFinite(notional) ? notional : null
-          };
-          histPush(sym, sample);
-          appendNDJSON(sym, sample);
-        }
-      } catch { }
-      if (trackProgress) OI_PROGRESS.done++;
-      await new Promise(r => setTimeout(r, sleepMs + (Math.random() * 50 | 0)));
+      BOOK.set(sym, {
+        symbol      : sym,
+        markPrice   : mp,
+        fundingRate : prev.fundingRate,
+        openInterest: oi,
+        notionalUSD : (Number.isFinite(oi) && Number.isFinite(mp)) ? oi * mp : NaN,
+        updatedAt   : now()
+      });
+    }catch(e){
+      // 忽略单个失败
     }
+    OI_PROGRESS.done++;
   }
-
-  await Promise.all(Array.from({ length: conc }, worker));
-  return ok;
 }
 
-/** ================== markPrice/资金费率 WS（原有逻辑） ================== */
-function startBinanceWS() {
-  try { if (wsBinance) wsBinance.close(); } catch { }
+// ========== markPrice WS ==========
 
+function startBinanceWS(){
   const url = 'wss://fstream.binance.com/stream?streams=!markPrice@arr@1s';
-  wsBinance = new WebSocket(url, { perMessageDeflate: false });
+  const ws  = new WebSocket(url);
 
-  wsBinance.on('open', () => {
-    console.log('[WS] connected:', url);
-    wsMsgCount = 0; wsLastBeat = now(); reconnectDelay = 3000;
-    wsBinance._pingTimer = setInterval(() => { try { wsBinance.ping(); } catch { } }, 15000);
-    wsBinance._statTimer = setInterval(() => { console.log(`[WS] alive; msgs=${wsMsgCount} (+)`); wsMsgCount = 0; }, 10000);
+  // 防止 markPrice 流异常把进程干掉
+  ws.on('error', err=>{
+    console.warn('binance markPrice ws error:', err && err.message);
   });
 
-  wsBinance.on('pong', () => wsLastBeat = now());
-
-  wsBinance.on('message', (buf) => {
-    wsMsgCount++; wsLastBeat = now();
-    try {
+  ws.on('message', buf=>{
+    try{
       const obj = JSON.parse(buf.toString());
-      const arr = obj && obj.data; if (!Array.isArray(arr)) return;
-      const t = now(); const changed = [];
-      for (const it of arr) {
-        const sym = it.s; if (!BOOK.has(sym)) continue;
-        const mp = Number(it.p); if (!Number.isFinite(mp)) continue;
-        const fr = (it.r != null) ? Number(it.r) * 100 : undefined;
+      const arr = obj.data;
+      if (!Array.isArray(arr)) return;
+
+      const t = now();
+      const changed = [];
+
+      for (const it of arr){
+        const sym = it.s;
+        if (!BOOK.has(sym)) continue;
+
+        const mp = Number(it.p);
+        if (!Number.isFinite(mp)) continue;
+
+        const fr   = it.r != null ? Number(it.r) * 100 : null;
         const prev = BOOK.get(sym);
-        const notional = Number.isFinite(prev.openInterest) ? prev.openInterest * mp : prev.notionalUSD;
+
+        const notional = Number.isFinite(prev.openInterest)
+          ? mp * prev.openInterest
+          : NaN;
+
         const next = {
           ...prev,
-          markPrice: mp,
-          fundingRate: (fr !== undefined ? fr : prev.fundingRate),
-          notionalUSD: notional,
-          updatedAt: t
+          markPrice   : mp,
+          fundingRate : fr ?? prev.fundingRate,
+          notionalUSD : notional,
+          updatedAt   : t
         };
+
         BOOK.set(sym, next);
-        changed.push({ s: sym, p: next.markPrice, r: next.fundingRate, u: next.updatedAt });
+        changed.push({ s: sym, p: mp, r: next.fundingRate, u: t });
       }
+
       if (changed.length) wsBus.broadcastDelta(changed);
-    } catch { }
+    }catch(e){}
   });
-
-  wsBinance.on('close', () => {
-    clearInterval(wsBinance._pingTimer); wsBinance._pingTimer = null;
-    clearInterval(wsBinance._statTimer); wsBinance._statTimer = null;
-    console.log('[WS] closed, retry in', reconnectDelay, 'ms');
-    setTimeout(startBinanceWS, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-  });
-
-  wsBinance.on('error', (e) => {
-    console.error('[WS] error:', e?.message || e);
-    try { wsBinance.close(); } catch { }
-  });
-
-  wsBinance._guard = setInterval(() => {
-    if (now() - wsLastBeat > 45000) {
-      try { wsBinance.terminate(); } catch { }
-    }
-  }, 10000);
 }
 
-/** ================== ✅ 单合约 aggTrade WS ================== */
+// ========== 成交 WS（单合约流） ==========
 
-// 前端每次发送 {t:'subTrades', symbol:'BTCUSDT'} 就会走到这里
-function switchTradesSymbol(symRaw) {
-  const sym = String(symRaw || '').toUpperCase().trim();
-  if (!sym) return;
-  if (!sym.endsWith('USDT')) return; // 只处理 USDT 永续
+let wsTrades = null;
 
-  if (tradesSymbol === sym && wsTrades && wsTrades.readyState === WebSocket.OPEN) {
-    // 已经订阅同一个，就不用动了
-    return;
-  }
-
-  tradesSymbol = sym;
-  tradesLastBeat = 0;
-  tradesReconnectDelay = 3000;
-
-  try { if (wsTrades) wsTrades.close(); } catch { }
+// 单独封装一个安全关闭
+function safeCloseTradesWS(){
+  if (!wsTrades) return;
+  try{
+    wsTrades.removeAllListeners('message');
+    wsTrades.removeAllListeners('error');
+    wsTrades.close();
+  }catch(e){}
   wsTrades = null;
+}
 
-  const stream = sym.toLowerCase() + '@aggTrade';
-  const url = `wss://fstream.binance.com/ws/${stream}`;
-  console.log('[WS-trades] connect symbol =', sym, 'url =', url);
-  wsTrades = new WebSocket(url, { perMessageDeflate: false });
+function switchTradesSymbol(symRaw){
+  const sym = String(symRaw).toUpperCase().trim();
+  if (!sym.endsWith('USDT')) return;
 
-  wsTrades.on('open', () => {
-    console.log('[WS-trades] opened for', sym);
-    tradesLastBeat = now();
-    wsTrades._pingTimer = setInterval(() => {
-      try { wsTrades.ping(); } catch { }
-    }, 15000);
+  // 先安全关掉旧 ws，吞掉它在关闭时抛的错误
+  safeCloseTradesWS();
+
+  const url = `wss://fstream.binance.com/ws/${sym.toLowerCase()}@aggTrade`;
+  const ws  = new WebSocket(url);
+  wsTrades  = ws;
+
+  // ⭐ 一定要监听 error，防止 “closed before established” 这类错误把进程炸掉
+  ws.on('error', err=>{
+    console.warn('trades ws error:', err && err.message);
   });
 
-  wsTrades.on('pong', () => { tradesLastBeat = now(); });
-
-  wsTrades.on('message', (buf) => {
-    tradesLastBeat = now();
-    try {
+  ws.on('message', buf=>{
+    try{
       const d = JSON.parse(buf.toString());
-      // futures aggTrade: {e, E, s, a, p, q, f, l, T, m, M}
-      const s = d.s || sym;
       const p = Number(d.p);
       const q = Number(d.q);
-      const ts = d.T || d.E || Date.now();
-      const m = !!d.m;       // true => taker 是卖方
-
       if (!Number.isFinite(p) || !Number.isFinite(q)) return;
-      const nu = p * q;      // 成交额（USDT）
 
-      const t = { s, p, q, nu, ts, m };
+      const ts = d.T || d.E || Date.now();
+      const nu = p * q;
+      const m  = !!d.m;
 
-      // 1. 内存缓存（给前端表格上限 10W 条用）
-      pushRecentTrade(s, t);
+      const t = { s: sym, p, q, nu, ts, m };
 
-      // 2. ✅ 写入本地 ndjson：<symbol>.trade.ndjson
-      appendTradeNDJSON(s, { ts, p, q, nu, m });
-
-      // 3. 直接推给前端
-      wsBus.broadcastTrades([t]);  // { t:'trades', rows:[...] }
-    } catch (e) {
-      console.error('[WS-trades] msg error:', e?.message || e);
-    }
+      appendTradeNDJSON(sym, t);
+      wsBus.broadcastTrades([t]);
+    }catch(e){}
   });
-
-  wsTrades.on('close', () => {
-    clearInterval(wsTrades._pingTimer); wsTrades._pingTimer = null;
-    console.log('[WS-trades] closed for', tradesSymbol);
-    // 简单重连一次（如果还在同一个 symbol 上）
-    if (tradesSymbol === sym) {
-      setTimeout(() => switchTradesSymbol(sym), tradesReconnectDelay);
-      tradesReconnectDelay = Math.min(tradesReconnectDelay * 2, 30000);
-    }
-  });
-
-  wsTrades.on('error', (e) => {
-    console.error('[WS-trades] error:', e?.message || e);
-    try { wsTrades.close(); } catch { }
-  });
-
-  wsTrades._guard = setInterval(() => {
-    if (now() - tradesLastBeat > 45000) {
-      try { wsTrades.terminate(); } catch { }
-    }
-  }, 10000);
 }
 
-// ==== REST 获取某个合约的 aggTrades（给 /api/trades 兜底用，可留着不用） ====
-async function fetchAggTrades(symbol, limit = 100) {
-  const sym = String(symbol || '').toUpperCase().trim();
-  if (!sym) return [];
-  const lim = Math.min(Number(limit) || 100, 1000);
-  const url = `${FAPI}${ENDPT.aggTrades}${encodeURIComponent(sym)}&limit=${lim}`;
-  const arr = await safeJSON(url);
-  if (!Array.isArray(arr)) return [];
-  return arr;
-}
-
-// ✅ 注册前端 WS 消息处理函数（由 wsBus 转发）
-wsBus.setClientMsgHandler((msg) => {
-  if (msg && msg.t === 'subTrades' && msg.symbol) {
-    switchTradesSymbol(msg.symbol);
-  }
+wsBus.setClientMsgHandler((msg)=>{
+  if (msg.t === 'subTrades') switchTradesSymbol(msg.symbol);
 });
 
-async function bootstrap() {
-  console.log('[INIT] load symbols...');
+// ========== openInterestHist：Binance 原始 OI 历史 ==========
+// period: '5m','15m','30m','1h','2h','4h','6h','12h','1d'
+// limit:  最大 500
+// startTime / endTime: 可选时间区间（毫秒）
+
+async function fetchOpenInterestHistory(symbol, period='5m', limit=500, startTime, endTime){
+  const qs = new URLSearchParams();
+  qs.set('symbol', symbol);
+  qs.set('period', period);
+  qs.set('limit', String(limit));
+  if (Number.isFinite(startTime)) qs.set('startTime', String(startTime));
+  if (Number.isFinite(endTime))   qs.set('endTime',   String(endTime));
+
+  const url = `${FAPI}${ENDPT.openInterestHist}?${qs.toString()}`;
+  const arr = await safeJSON(url);
+
+  return arr.map(x => ({
+    t : Number(x.timestamp),
+    oi: Number(x.sumOpenInterest),
+    // openInterestHist 的 price 基本是 null，这里统一置 null
+    mp: null,
+    nu: x.sumOpenInterestValue != null ? Number(x.sumOpenInterestValue) : null
+  }));
+}
+
+// ========== k 线拿价格历史（收盘价） ==========
+// interval: '5m','15m','30m','1h','2h','4h','6h','12h','1d'
+
+async function fetchMarkPriceHistory(symbol, interval='5m', limit=500, startTime, endTime){
+  const qs = new URLSearchParams();
+  qs.set('symbol', symbol);
+  qs.set('interval', interval);
+  qs.set('limit', String(Math.min(limit, 1500)));
+  if (Number.isFinite(startTime)) qs.set('startTime', String(startTime));
+  if (Number.isFinite(endTime))   qs.set('endTime',   String(endTime));
+
+  const url = `${FAPI}/fapi/v1/klines?${qs.toString()}`;
+  const arr = await safeJSON(url);
+
+  // kline: [openTime, open, high, low, close, volume, closeTime, ...]
+  return arr.map(k => ({
+    t  : Number(k[0]),   // openTime
+    mp : Number(k[4])    // close
+  }));
+}
+
+// ========== 刷新所有合约的 OI 历史，写入内存 + 文件 cache ==========
+
+async function refreshAllOIHistory(){
+  const syms   = SYMBOLS();
+  const period = '5m';
+  const limit  = 500;
+
+  for (const sym of syms){
+    try{
+      const samples = await fetchOpenInterestHistory(sym, period, limit);
+      setOIHist(sym, samples);
+    }catch(e){
+      // 某个 symbol 异常直接跳过
+    }
+  }
+
+  // 写到 data/oi_hist.json
+  saveOIHistToFile();
+}
+
+// ========== 启动 ==========
+
+async function bootstrap(){
   const list = await listUSDTPerpSymbols();
   setSYMBOLS(list);
-  console.log('[INIT] USDT perpetual symbols =', list.length);
 
-  console.log('[INIT] prime premiumAll...');
+  // 价格 / FR
   await refreshPremiumAll();
+  startBinanceWS();
 
-  console.log('[INIT] start WS ...');
-  startBinanceWS();   // markPrice / funding
-  // 成交流不自动起，等前端 subTrades 时再 switchTradesSymbol
+  // 当前 OI 快照（用于 table）
+  await refreshOpenInterestAll();
 
-  console.log('[INIT] prime OI (first sweep)...');
-  setOISweep(true); setBOOT(false);
-  await refreshOpenInterestAll({ conc: 8, sleepMs: 60, trackProgress: true }).catch(() => { });
-  setOISweep(false); setBOOT(true);
-  console.log('[INIT] OI sweep done:', OI_PROGRESS.done);
+  // 初始化拉一轮 OI 历史，用来画图
+  await refreshAllOIHistory();
 
-  setInterval(async () => {
-    try {
-      setOISweep(true);
-      OI_PROGRESS.total = (require('../store').SYMBOLS)().length;
-      OI_PROGRESS.done = 0;
-      await refreshOpenInterestAll({ conc: 8, sleepMs: 60, trackProgress: true });
-    } finally { setOISweep(false); }
-  }, 180000);
+  // 标记启动完成，前端 progress 就会放行
+  setBOOT(true);
 
-  setInterval(() => refreshPremiumAll().catch(() => { }), 30000);
+  // 定时刷新：快照
+  setInterval(refreshOpenInterestAll, 180000);  // 3min
+  setInterval(refreshPremiumAll,      30000);   // 30s
+
+  // 定时刷新：OI 历史 cache（全量覆盖）
+  setInterval(refreshAllOIHistory, 5 * 60 * 1000); // 5min
 }
 
 module.exports = {
   bootstrap,
-  listUSDTPerpSymbols,
-  refreshPremiumAll,
-  refreshOpenInterestAll,
-  fetchAggTrades,
-
-  // 给其他模块用
   switchTradesSymbol,
-  getRecentTrades,
+  fetchOpenInterestHistory,
+  fetchMarkPriceHistory
 };

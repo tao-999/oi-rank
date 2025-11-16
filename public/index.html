@@ -8,20 +8,29 @@
   <style>
     /* 仅隐藏旧的状态条（原来会显示“完成”） */
     #state{ display:none !important; }
+
+    /* meta 条：贴在表格上方 */
+    #meta {
+      margin-top: 8px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #9aa4b2;
+    }
   </style>
 </head>
 <body>
 <header>
   <h1>USDT 永续 · 名义持仓（USD）排行榜（默认升序）</h1>
+
   <div class="controls">
     <div class="card">
       <label>名义最小值（USD）
-        <input id="minUSD" type="number" step="100000" value="10000000">
+        <input id="minUSD" type="number" step="100000" placeholder="不限">
       </label>
     </div>
     <div class="card">
       <label>名义最大值（USD）
-        <input id="maxUSD" type="number" step="100000" value="20000000">
+        <input id="maxUSD" type="number" step="100000" placeholder="不限">
       </label>
     </div>
     <div class="card">
@@ -29,7 +38,6 @@
         <input id="wins" value="1h,4h,24h">
       </label>
     </div>
-    <!-- ✅ 新增：只看关注 -->
     <div class="card">
       <label style="flex-direction:row;align-items:center;gap:8px">
         <input id="onlyFav" type="checkbox" style="min-width:auto">
@@ -41,7 +49,6 @@
         <input id="symFilter" placeholder="如：BTC, DOGE, AI">
       </label>
     </div>
-
   </div>
 </header>
 
@@ -50,7 +57,10 @@
   <div class="ov-card">
     <h2 class="ov-title">初始化数据中…</h2>
     <div class="bar"><i id="barFill"></i></div>
-    <div class="ov-meta"><div id="ovText">准备请求…</div><div id="ovPct">0%</div></div>
+    <div class="ov-meta">
+      <div id="ovText">准备请求…</div>
+      <div id="ovPct">0%</div>
+    </div>
   </div>
 </div>
 
@@ -69,22 +79,24 @@
         <option value="1h">1 小时</option>
         <option value="2h">2 小时</option>
         <option value="4h">4 小时</option>
-        <option value="8h">8 小时</option>
+        <option value="6h">6 小时</option>
         <option value="12h">12 小时</option>
         <option value="1d">1 日</option>
-        <option value="3d">3 日</option>
-        <option value="1w">1 周</option>
       </select>
+
       <span class="small" id="chartMeta">—</span>
     </div>
-    <canvas id="chart" width="540" height="340"></canvas>
+
+    <!-- 放大画布分辨率：更宽更高 -->
+    <canvas id="chart" width="720" height="380"></canvas>
+
+    <!-- ✅ 预测结果面板：供 chart.js 渲染 -->
     <div id="signalBox" class="signal"></div>
-    <div class="small">图表：名义持仓（USD，M）；每个时间桶取最后一笔（close）。支持拖拽/缩放。</div>
-        <!-- ✅ 最新成交单面板（带区间过滤） -->
+
+    <!-- 最新成交单面板（带区间过滤） -->
     <div id="tradesPanel">
       <div class="trades-header">
         <span class="small trades-title">最新成交</span>
-        <button id="tradesRefresh" class="btn small">刷新</button>
       </div>
 
       <div class="row trades-filter">
@@ -122,13 +134,16 @@
 <main>
   <!-- 这行已隐藏；保留节点避免旧代码报错 -->
   <div id="state" class="muted">WS 实时价/资费；快照每 1000s 自动刷新一次；趋势列从本地历史推算</div>
-  <div style="overflow:auto;margin-top:10px">
+
+  <!-- meta 放在表格正上方 -->
+  <div id="meta" class="muted"></div>
+
+  <div style="overflow:auto;margin-top:4px">
     <table id="tbl">
       <thead id="thead"></thead>
       <tbody id="tbody"></tbody>
     </table>
   </div>
-  <div id="meta" class="muted" style="margin-top:10px"></div>
 </main>
 
 <!-- 模块入口 -->

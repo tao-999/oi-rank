@@ -2,14 +2,13 @@
 const WebSocket = require('ws');
 const { BOOK } = require('./store');
 
-// 由外部（比如 binance.js）注册，用来处理前端发来的控制消息
 let onClientMsg = null;
-
 let wss = null;
 
-function buildInitSnapshot() {
+// 初次连接快照
+function buildInitSnapshot(){
   const map = {};
-  for (const [sym, row] of BOOK.entries()) {
+  for (const [sym, row] of BOOK.entries()){
     map[sym] = {
       p: row.markPrice,
       r: row.fundingRate,
@@ -19,57 +18,59 @@ function buildInitSnapshot() {
   return map;
 }
 
-function attach(server) {
+function attach(server){
   wss = new WebSocket.Server({ server, path: '/ws' });
 
-  wss.on('connection', (ws) => {
-    // 初次连接：推一份价格/资金费率快照
+  wss.on('connection', (ws)=>{
+    // 初次发快照
     ws.send(JSON.stringify({ t: 'init', rows: buildInitSnapshot() }));
 
-    // 接收前端控制消息（如 subTrades）
-    ws.on('message', (buf) => {
-      try {
+    ws.on('message', buf=>{
+      try{
         const msg = JSON.parse(buf.toString());
-        if (onClientMsg) {
-          onClientMsg(msg, ws);
-        }
-      } catch {
-        // ignore
-      }
+        if (onClientMsg) onClientMsg(msg, ws);
+      }catch{}
+    });
+
+    // 防御性：避免某些 ws 错误把服务搞崩
+    ws.on('error', err=>{
+      console.warn('client ws error:', err && err.message);
     });
   });
 }
 
-function broadcast(payload) {
+// 广播通用
+function broadcast(payload){
   if (!wss) return;
   const msg = JSON.stringify(payload);
-  for (const c of wss.clients) {
-    if (c.readyState === WebSocket.OPEN) {
+  for (const c of wss.clients){
+    if (c.readyState === WebSocket.OPEN){
       c.send(msg);
     }
   }
 }
 
 // 价格/资金费率增量
-function broadcastDelta(rows) {
+function broadcastDelta(rows){
   if (!rows || !rows.length) return;
   broadcast({ t: 'delta', rows });
 }
 
 // 成交单增量
-function broadcastTrades(rows) {
+function broadcastTrades(rows){
   if (!rows || !rows.length) return;
   broadcast({ t: 'trades', rows });
 }
 
-// 由业务模块注册客户端消息处理函数
-function setClientMsgHandler(fn) {
+// 注册客户端消息处理（如 subTrades）
+function setClientMsgHandler(fn){
   onClientMsg = (typeof fn === 'function') ? fn : null;
 }
 
 module.exports = {
   attach,
+  broadcast,
   broadcastDelta,
   broadcastTrades,
-  setClientMsgHandler,
+  setClientMsgHandler
 };

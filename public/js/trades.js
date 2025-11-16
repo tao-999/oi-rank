@@ -11,7 +11,7 @@ export function createTradesPanel() {
 
   const btnReel = el('tradesRefresh'); // 现在只是“重渲染”，不发请求
 
-  const MAX_TRADES = 100000; // 表格上限 10W 条（内存也是）
+  const MAX_TRADES = 20000; // ✅ 表格上限 2W 条
   let activeSym = null;
   let buf = []; // [{ s,p,q,nu,ts,m }, ...]
 
@@ -62,7 +62,6 @@ export function createTradesPanel() {
         const side = t.m ? '卖出' : '买入';
         const cls  = t.m ? 'sell' : 'buy';
 
-        // 数量这里用成交额 USDT，方便你后续看主力大单
         const nuStr = Number(t.nu).toLocaleString(undefined, {
           maximumFractionDigits: 2
         });

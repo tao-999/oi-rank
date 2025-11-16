@@ -217,12 +217,13 @@ tr.row-active{
   font-size:12px;
 }
 
+/* ✅ 抽屉加宽一点 */
 #drawer{
   position:fixed;
   top:0;
   right:0;
   height:100%;
-  width:min(560px,96vw);
+  width:min(720px,96vw);
   transform:translateX(100%);
   transition:transform .25s ease;
   z-index:9998;
@@ -254,11 +255,12 @@ tr.row-active{
   display:flex;
   flex-direction:column;
   gap:10px;
-
-  /* ✅ 新增：让内容区占满剩余高度并可以纵向滚动 */
-  flex: 1;
-  overflow-y: auto;
-  min-height: 0;
+  /* 内容区占满剩余高度并可以纵向滚动 */
+  flex:1;
+  overflow-y:auto;
+  min-height:0;
+  /* 🚫 禁止滚动链到外层页面 */
+  overscroll-behavior-y: contain;
 }
 
 .row{
@@ -276,9 +278,10 @@ tr.row-active{
   padding:6px 10px;
 }
 
+/* ✅ 画布高度也加一点，配合 HTML 的 height=380 */
 canvas{
   width:100%;
-  height:340px;
+  height:380px;
   background:#0b121f;
   border:1px solid #1f2740;
   border-radius:10px;
@@ -392,15 +395,26 @@ canvas{
   font-weight:500;
 }
 
+/* ✅ 成交量过滤一行排好，空间不足再优雅换行 */
 .trades-filter{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
   margin-top:4px;
-  gap:10px;
 }
 
 .trades-filter-item{
+  display:flex;
   flex-direction:row;
   align-items:center;
   gap:6px;
+  white-space:nowrap;
+}
+
+.trades-filter-item input{
+  width:90px;
+  max-width:100%;
 }
 
 .trades-table-wrap{
