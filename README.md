@@ -7,8 +7,7 @@
 > 名义持仓（Notional USD）用于衡量某合约上“资金的总敞口规模”。  
 > 趋势列基于本地落盘历史计算，独立于交易所的聚合“公开指标”。
 
-<img width="2520" height="1214" alt="image" src="https://github.com/user-attachments/assets/a9f99426-057b-466f-a321-ada497c6cc8c" />
-
+<img width="2524" height="1205" alt="image" src="https://github.com/user-attachments/assets/f0275b68-71d1-44b7-9c65-12ad05a2362b" />
 
 ---
 
